@@ -1,0 +1,12 @@
+Package: sam-rs
+Version: @VERSION@
+Section: utils
+Priority: optional
+Architecture: @ARCH@
+Maintainer: apiplant <releases@apiplant.com>
+Installed-Size: @INSTALLED_SIZE@
+Homepage: https://github.com/apiplant/sam-rs
+Description: Rust (candle) inference for Segment Anything models
+ sam-rs segments images with SAM, MobileSAM, EfficientSAM, SAM 2 and SAM 3,
+ locally via candle. Model weights are downloaded from Hugging Face on
+ first use into ~/.cache/sam-rs.

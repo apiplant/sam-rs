@@ -1,0 +1,467 @@
+use std::time::Instant;
+
+use anyhow::{bail, Context, Result};
+use candle_core::{DType, Device};
+use clap::Parser;
+use sam_rs::{Prompt, Sam, SamVariant};
+
+#[derive(Parser)]
+#[command(version, about = "Segment Anything inference in Rust (candle), CPU and CUDA")]
+struct Args {
+    /// Input image
+    #[arg(long)]
+    image: String,
+    /// Model: sam-vit-b | sam-vit-l | sam-vit-h | mobile-sam | sam2.1-hiera-{tiny,small,base-plus,large} | sam2-hiera-* | sam3
+    #[arg(long, default_value = "sam-vit-b")]
+    model: String,
+    /// Use this checkpoint file instead of the cached / downloaded one (Meta layout, .safetensors)
+    #[arg(long)]
+    weights: Option<String>,
+    /// Text prompt (SAM 3): find and segment every instance of this concept
+    #[arg(long)]
+    text: Option<String>,
+    /// Minimum instance score for --text
+    #[arg(long, default_value_t = 0.3)]
+    threshold: f32,
+    /// Compute dtype on CUDA: f16 (default) or f32
+    #[arg(long, default_value = "f16")]
+    dtype: String,
+    /// Point prompts "x,y" (foreground) or "x,y,0" (background); repeatable
+    #[arg(long = "point")]
+    points: Vec<String>,
+    /// Box prompt "x0,y0,x1,y1". SAM 3: repeatable, positive exemplar boxes ("find more like this")
+    #[arg(long = "box")]
+    boxes: Vec<String>,
+    /// SAM 3: track the --point/--box object through the frames (images, sorted by name) of this directory
+    #[arg(long)]
+    video: Option<String>,
+    /// SAM 3 --video: index of the frame the prompt belongs to (tracking runs forward from there)
+    #[arg(long, default_value_t = 0)]
+    prompt_frame: usize,
+    /// SAM 3: treat --point / --box as SAM-style prompts for one object (the tracker) instead of text/exemplars
+    #[arg(long)]
+    tracker: bool,
+    /// SAM 3: negative exemplar box "x0,y0,x1,y1" (repeatable)
+    #[arg(long = "neg-box")]
+    neg_boxes: Vec<String>,
+    /// Save the best mask as a PNG
+    #[arg(long)]
+    out: Option<String>,
+    /// Save this candidate (0-2) instead of the one with the highest predicted IoU
+    #[arg(long)]
+    index: Option<usize>,
+    /// Return a single mask instead of three candidates
+    #[arg(long)]
+    single: bool,
+    /// Force CPU
+    #[arg(long)]
+    cpu: bool,
+    /// CPU: use exact f32 instead of the bf16 kernels (AVX-512 BF16 CPUs only; slower, bit-for-bit f32)
+    #[arg(long)]
+    f32: bool,
+    /// Time the encoder and decoder over N runs
+    #[arg(long)]
+    bench: Option<usize>,
+}
+
+fn nums(s: &str) -> Result<Vec<f32>> {
+    s.split(',').map(|v| v.trim().parse::<f32>().with_context(|| format!("bad number {v:?}"))).collect()
+}
+
+fn main() -> Result<()> {
+    sam_rs::cpu_gemm::init_threads();
+    let a = Args::parse();
+    if a.f32 {
+        sam_rs::cpu_gemm::set_enabled(false);
+    }
+    if let Some(v) = sam_rs::sam2::Sam2Variant::parse(&a.model) {
+        return run_sam2(&a, v);
+    }
+    if a.model.starts_with("sam3") {
+        return run_sam3(&a);
+    }
+    let variant = SamVariant::parse(&a.model).with_context(|| format!("unknown model {}", a.model))?;
+    let device = if a.cpu { Device::Cpu } else { Device::cuda_if_available(0)? };
+    let dtype = if device.is_cuda() { DType::F16 } else { DType::F32 };
+    let t = Instant::now();
+    let sam = match &a.weights {
+        Some(w) => Sam::from_file(std::path::Path::new(w), variant, &device, dtype)?,
+        None => Sam::from_pretrained(variant, &device, dtype)?,
+    };
+    eprintln!("loaded in {:.2?} on {:?} ({dtype:?})", t.elapsed(), device.location());
+
+    let img = image::open(&a.image).with_context(|| format!("opening {}", a.image))?.to_rgb8();
+    let prompt = if let Some(b) = a.boxes.first() {
+        let v = nums(b)?;
+        if v.len() != 4 {
+            bail!("--box needs x0,y0,x1,y1");
+        }
+        Prompt::Box([v[0], v[1], v[2], v[3]])
+    } else if !a.points.is_empty() {
+        let mut p = vec![];
+        for s in &a.points {
+            let v = nums(s)?;
+            if v.len() < 2 {
+                bail!("--point needs x,y[,label]");
+            }
+            p.push((v[0], v[1], v.get(2).map_or(true, |l| *l != 0.0)));
+        }
+        Prompt::Points(p)
+    } else {
+        Prompt::Points(vec![(img.width() as f32 / 2.0, img.height() as f32 / 2.0, true)])
+    };
+
+    let t = Instant::now();
+    let emb = sam.embed(&img)?;
+    let masks = sam.predict(&emb, &prompt, !a.single)?;
+    eprintln!("embed + decode: {:.2?}", t.elapsed());
+    if let Some(n) = a.bench {
+        let t = Instant::now();
+        for _ in 0..n {
+            sam_rs::image_proc::prepare_sam1(&img, &sam.device, sam.dtype)?;
+        }
+        sam.sync()?;
+        eprintln!("preprocess alone: {:.1} ms", t.elapsed().as_secs_f64() / n as f64 * 1e3);
+        let (mut te, mut td) = (0.0, 0.0);
+        for _ in 0..n {
+            let t = Instant::now();
+            let e = sam.embed(&img)?;
+            sam.sync()?;
+            te += t.elapsed().as_secs_f64();
+            let t = Instant::now();
+            sam.predict(&e, &prompt, !a.single)?;
+            td += t.elapsed().as_secs_f64();
+        }
+        eprintln!("bench x{n}: encoder {:.1} ms, decoder {:.1} ms", te / n as f64 * 1e3, td / n as f64 * 1e3);
+    }
+    let best = match a.index {
+        Some(i) => masks.get(i).with_context(|| format!("--index {i}: only {} masks", masks.len()))?,
+        None => masks.iter().max_by(|a, b| a.iou.total_cmp(&b.iou)).context("no masks")?,
+    };
+    for (i, m) in masks.iter().enumerate() {
+        println!("mask {i}: iou {:.3}, area {}", m.iou, m.data.iter().filter(|&&v| v > 0).count());
+    }
+    if let Some(out) = &a.out {
+        let buf: Vec<u8> = best.data.iter().map(|&v| v * 255).collect();
+        image::GrayImage::from_raw(best.width as u32, best.height as u32, buf).context("mask buffer")?.save(out)?;
+    }
+    Ok(())
+}
+
+fn run_sam3(a: &Args) -> Result<()> {
+    use sam_rs::sam3::Sam3;
+    if a.video.is_some() {
+        return run_sam3_video(a);
+    }
+    if !a.points.is_empty() || a.tracker {
+        return run_sam3_tracker(a);
+    }
+    let mut exemplars: Vec<([f32; 4], bool)> = vec![];
+    for (list, positive) in [(&a.boxes, true), (&a.neg_boxes, false)] {
+        for b in list {
+            let v = nums(b)?;
+            if v.len() != 4 {
+                bail!("boxes need x0,y0,x1,y1");
+            }
+            exemplars.push(([v[0], v[1], v[2], v[3]], positive));
+        }
+    }
+    // a purely visual query uses the placeholder text the model was trained with
+    let prompt = a.text.as_deref().unwrap_or(if exemplars.is_empty() { "" } else { "visual" });
+    if prompt.is_empty() {
+        bail!("SAM 3 needs --text and/or --box");
+    }
+    let device = if a.cpu { Device::Cpu } else { Device::cuda_if_available(0)? };
+    let dtype = match (device.is_cuda(), a.dtype.as_str()) {
+        (true, "f16") => DType::F16,
+        _ => DType::F32,
+    };
+    let t = Instant::now();
+    let sam = Sam3::from_pretrained(&device, dtype)?;
+    eprintln!("loaded in {:.2?} on {:?} ({dtype:?})", t.elapsed(), device.location());
+    let img = image::open(&a.image).with_context(|| format!("opening {}", a.image))?.to_rgb8();
+    let t = Instant::now();
+    let feats = sam.encode_image(&img)?;
+    let found = sam.segment_with(&feats, prompt, &exemplars, a.threshold)?;
+    eprintln!("encode + segment: {:.2?}", t.elapsed());
+    if let Some(n) = a.bench {
+        let (mut te, mut th) = (0.0, 0.0);
+        for _ in 0..n {
+            let t = Instant::now();
+            let f = sam.encode_image(&img)?;
+            sam.sync()?;
+            te += t.elapsed().as_secs_f64();
+            let t = Instant::now();
+            sam.segment_with(&f, prompt, &exemplars, a.threshold)?;
+            th += t.elapsed().as_secs_f64();
+        }
+        eprintln!("bench x{n}: image encoder {:.1} ms, text + head + masks {:.1} ms", te / n as f64 * 1e3, th / n as f64 * 1e3);
+    }
+    println!("{} instance(s) for {prompt:?}", found.len());
+    for (i, f) in found.iter().enumerate() {
+        println!("  #{i}: score {:.3} box [{:.0}, {:.0}, {:.0}, {:.0}] area {}", f.score, f.bbox[0], f.bbox[1], f.bbox[2], f.bbox[3], f.mask.data.iter().filter(|&&v| v > 0).count());
+    }
+    if let (Some(out), Some(best)) = (&a.out, found.first()) {
+        let buf: Vec<u8> = best.mask.data.iter().map(|&v| v * 255).collect();
+        image::GrayImage::from_raw(best.mask.width as u32, best.mask.height as u32, buf).context("mask buffer")?.save(out)?;
+    }
+    Ok(())
+}
+
+/// SAM 3's image tracker: SAM 1/2-style point and box prompts for a single object.
+fn run_sam3_tracker(a: &Args) -> Result<()> {
+    use sam_rs::sam3::Sam3;
+    let device = if a.cpu { Device::Cpu } else { Device::cuda_if_available(0)? };
+    let dtype = match (device.is_cuda(), a.dtype.as_str()) {
+        (true, "f16") => DType::F16,
+        _ => DType::F32,
+    };
+    let sam = Sam3::from_pretrained(&device, dtype)?;
+    let img = image::open(&a.image).with_context(|| format!("opening {}", a.image))?.to_rgb8();
+    let mut points = vec![];
+    for s in &a.points {
+        let v = nums(s)?;
+        if v.len() < 2 {
+            bail!("--point needs x,y[,label]");
+        }
+        points.push((v[0], v[1], v.get(2).map_or(true, |l| *l != 0.0)));
+    }
+    let mut boxes = vec![];
+    for s in &a.boxes {
+        let v = nums(s)?;
+        if v.len() != 4 {
+            bail!("--box needs x0,y0,x1,y1");
+        }
+        boxes.push([v[0], v[1], v[2], v[3]]);
+    }
+    if points.is_empty() && boxes.is_empty() {
+        bail!("give --point and/or --box");
+    }
+    let t = Instant::now();
+    let feats = sam.encode_image(&img)?;
+    let tf = sam.tracker_features(&feats)?;
+    let (masks, obj) = sam.segment_points(&feats, &tf, &points, &boxes, !a.single)?;
+    eprintln!("encode + tracker: {:.2?}", t.elapsed());
+    if let Some(n) = a.bench {
+        let (mut te, mut td) = (0.0, 0.0);
+        for _ in 0..n {
+            let t = Instant::now();
+            let f = sam.encode_image(&img)?;
+            let tf = sam.tracker_features(&f)?;
+            sam.sync()?;
+            te += t.elapsed().as_secs_f64();
+            let t = Instant::now();
+            sam.segment_points(&f, &tf, &points, &boxes, !a.single)?;
+            td += t.elapsed().as_secs_f64();
+        }
+        eprintln!("bench x{n}: image + tracker features {:.1} ms, prompt decode {:.1} ms", te / n as f64 * 1e3, td / n as f64 * 1e3);
+    }
+    println!("object score {obj:.2} ({})", if obj > 0.0 { "object present" } else { "no object" });
+    for (i, m) in masks.iter().enumerate() {
+        println!("mask {i}: iou {:.3}, area {}", m.iou, m.data.iter().filter(|&&v| v > 0).count());
+    }
+    let best = match a.index {
+        Some(i) => masks.get(i).with_context(|| format!("--index {i}: only {} masks", masks.len()))?,
+        None => masks.iter().max_by(|x, y| x.iou.total_cmp(&y.iou)).context("no masks")?,
+    };
+    if let Some(out) = &a.out {
+        let buf: Vec<u8> = best.data.iter().map(|&v| v * 255).collect();
+        image::GrayImage::from_raw(best.width as u32, best.height as u32, buf).context("mask buffer")?.save(out)?;
+    }
+    Ok(())
+}
+
+/// SAM 3 video tracker over a directory of frames; writes one mask PNG per frame into `--out DIR`.
+fn run_sam3_video(a: &Args) -> Result<()> {
+    use sam_rs::sam3::{video::{FramePrompt, Session}, Sam3};
+    let dir = a.video.as_deref().context("--video DIR")?;
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .with_context(|| format!("reading {dir}"))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| matches!(p.extension().and_then(|e| e.to_str()).map(str::to_lowercase).as_deref(), Some("png" | "jpg" | "jpeg" | "bmp" | "webp")))
+        .collect();
+    files.sort();
+    if a.prompt_frame >= files.len() {
+        bail!("--prompt-frame {} but only {} frames in {dir}", a.prompt_frame, files.len());
+    }
+    let mut prompt = FramePrompt::default();
+    let first = image::open(&files[a.prompt_frame])?.to_rgb8();
+    let (sx, sy) = (1008.0 / first.width() as f32, 1008.0 / first.height() as f32);
+    for s in &a.points {
+        let v = nums(s)?;
+        if v.len() < 2 {
+            bail!("--point needs x,y[,label]");
+        }
+        prompt.points.push((v[0] * sx, v[1] * sy, v.get(2).map_or(1, |l| (*l != 0.0) as i32)));
+    }
+    for s in &a.boxes {
+        let v = nums(s)?;
+        if v.len() != 4 {
+            bail!("--box needs x0,y0,x1,y1");
+        }
+        // in video a box is two corner points labelled 2 and 3
+        prompt.points.push((v[0] * sx, v[1] * sy, 2));
+        prompt.points.push((v[2] * sx, v[3] * sy, 3));
+    }
+    if prompt.points.is_empty() {
+        bail!("give --point and/or --box for the object to track");
+    }
+    let device = if a.cpu { Device::Cpu } else { Device::cuda_if_available(0)? };
+    let dtype = match (device.is_cuda(), a.dtype.as_str()) {
+        (true, "f16") => DType::F16,
+        _ => DType::F32,
+    };
+    let sam = Sam3::from_pretrained(&device, dtype)?;
+    let mut session = Session::new(Some(files.len() - a.prompt_frame));
+    session.add_prompt(0, prompt);
+    if let Some(out) = &a.out {
+        std::fs::create_dir_all(out)?;
+    }
+    let t_all = Instant::now();
+    for (i, path) in files.iter().enumerate().skip(a.prompt_frame) {
+        let t = Instant::now();
+        let img = image::open(path).with_context(|| format!("opening {}", path.display()))?.to_rgb8();
+        let tf = sam.encode_for_tracking(&img)?;
+        let r = sam.track_frame(&mut session, &tf)?;
+        let mask = sam.frame_mask(&r, (img.height() as usize, img.width() as usize))?;
+        let area = mask.data.iter().filter(|&&v| v > 0).count();
+        println!("frame {i}: object score {:6.2} ({}), mask area {area}  [{:.0?}]", r.object_score, if r.object_score > 0.0 { "present" } else { "absent" }, t.elapsed());
+        if let Some(out) = &a.out {
+            let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| format!("{i}"));
+            let buf: Vec<u8> = mask.data.iter().map(|&v| v * 255).collect();
+            image::GrayImage::from_raw(mask.width as u32, mask.height as u32, buf).context("mask buffer")?.save(std::path::Path::new(out).join(format!("{name}_mask.png")))?;
+        }
+    }
+    eprintln!("{} frames in {:.2?}", files.len() - a.prompt_frame, t_all.elapsed());
+    Ok(())
+}
+
+/// SAM 2 / 2.1: point and box prompts, same flags as SAM 1.
+fn run_sam2(a: &Args, variant: sam_rs::sam2::Sam2Variant) -> Result<()> {
+    use sam_rs::sam2::Sam2;
+    if a.video.is_some() {
+        return run_sam2_video(a, variant);
+    }
+    let device = if a.cpu { Device::Cpu } else { Device::cuda_if_available(0)? };
+    let dtype = match (device.is_cuda(), a.dtype.as_str()) {
+        (true, "f16") => DType::F16,
+        _ => DType::F32,
+    };
+    let t = Instant::now();
+    let sam = Sam2::from_pretrained(variant, &device, dtype)?;
+    eprintln!("loaded {} in {:.2?} on {:?} ({dtype:?})", variant.repo(), t.elapsed(), device.location());
+    let img = image::open(&a.image).with_context(|| format!("opening {}", a.image))?.to_rgb8();
+    let mut points = vec![];
+    for s in &a.points {
+        let v = nums(s)?;
+        if v.len() < 2 {
+            bail!("--point needs x,y[,label]");
+        }
+        points.push((v[0], v[1], v.get(2).map_or(true, |l| *l != 0.0)));
+    }
+    let mut boxes = vec![];
+    for s in &a.boxes {
+        let v = nums(s)?;
+        if v.len() != 4 {
+            bail!("--box needs x0,y0,x1,y1");
+        }
+        boxes.push([v[0], v[1], v[2], v[3]]);
+    }
+    if points.is_empty() && boxes.is_empty() {
+        points.push((img.width() as f32 / 2.0, img.height() as f32 / 2.0, true));
+    }
+    let t = Instant::now();
+    let emb = sam.embed(&img)?;
+    let (masks, obj) = sam.predict(&emb, &points, &boxes, !a.single)?;
+    eprintln!("embed + decode: {:.2?}", t.elapsed());
+    if let Some(n) = a.bench {
+        let (mut te, mut td) = (0.0, 0.0);
+        for _ in 0..n {
+            let t = Instant::now();
+            let e = sam.embed(&img)?;
+            sam.sync()?;
+            te += t.elapsed().as_secs_f64();
+            let t = Instant::now();
+            sam.predict(&e, &points, &boxes, !a.single)?;
+            td += t.elapsed().as_secs_f64();
+        }
+        eprintln!("bench x{n}: encoder {:.1} ms, decoder {:.1} ms", te / n as f64 * 1e3, td / n as f64 * 1e3);
+    }
+    println!("object score {obj:.2} ({})", if obj > 0.0 { "object present" } else { "no object" });
+    for (i, m) in masks.iter().enumerate() {
+        println!("mask {i}: iou {:.3}, area {}", m.iou, m.data.iter().filter(|&&v| v > 0).count());
+    }
+    let best = match a.index {
+        Some(i) => masks.get(i).with_context(|| format!("--index {i}: only {} masks", masks.len()))?,
+        None => masks.iter().max_by(|x, y| x.iou.total_cmp(&y.iou)).context("no masks")?,
+    };
+    if let Some(out) = &a.out {
+        let buf: Vec<u8> = best.data.iter().map(|&v| v * 255).collect();
+        image::GrayImage::from_raw(best.width as u32, best.height as u32, buf).context("mask buffer")?.save(out)?;
+    }
+    Ok(())
+}
+
+/// SAM 2 video tracking over a directory of frames; writes one mask PNG per frame into `--out DIR`.
+fn run_sam2_video(a: &Args, variant: sam_rs::sam2::Sam2Variant) -> Result<()> {
+    use sam_rs::{sam2::Sam2, sam3::video::Session};
+    let dir = a.video.as_deref().context("--video DIR")?;
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .with_context(|| format!("reading {dir}"))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| matches!(p.extension().and_then(|e| e.to_str()).map(str::to_lowercase).as_deref(), Some("png" | "jpg" | "jpeg" | "bmp" | "webp")))
+        .collect();
+    files.sort();
+    if a.prompt_frame >= files.len() {
+        bail!("--prompt-frame {} but only {} frames in {dir}", a.prompt_frame, files.len());
+    }
+    let device = if a.cpu { Device::Cpu } else { Device::cuda_if_available(0)? };
+    let dtype = match (device.is_cuda(), a.dtype.as_str()) {
+        (true, "f16") => DType::F16,
+        _ => DType::F32,
+    };
+    let sam = Sam2::from_pretrained(variant, &device, dtype)?;
+    let first = image::open(&files[a.prompt_frame])?.to_rgb8();
+    let orig = (first.height() as usize, first.width() as usize);
+    let mut points = vec![];
+    for s in &a.points {
+        let v = nums(s)?;
+        if v.len() < 2 {
+            bail!("--point needs x,y[,label]");
+        }
+        points.push((v[0], v[1], v.get(2).map_or(true, |l| *l != 0.0)));
+    }
+    let mut boxes = vec![];
+    for s in &a.boxes {
+        let v = nums(s)?;
+        if v.len() != 4 {
+            bail!("--box needs x0,y0,x1,y1");
+        }
+        boxes.push([v[0], v[1], v[2], v[3]]);
+    }
+    if points.is_empty() && boxes.is_empty() {
+        bail!("give --point and/or --box for the object to track");
+    }
+    let mut session = Session::new(Some(files.len() - a.prompt_frame));
+    session.add_prompt(0, sam.prompt_points(orig, &points, &boxes));
+    if let Some(out) = &a.out {
+        std::fs::create_dir_all(out)?;
+    }
+    let t_all = Instant::now();
+    for (i, path) in files.iter().enumerate().skip(a.prompt_frame) {
+        let t = Instant::now();
+        let img = image::open(path).with_context(|| format!("opening {}", path.display()))?.to_rgb8();
+        let e = sam.embed(&img)?;
+        let r = sam.track_frame(&mut session, &e)?;
+        let mask = sam.frame_mask(&r, (img.height() as usize, img.width() as usize))?;
+        let area = mask.data.iter().filter(|&&v| v > 0).count();
+        println!("frame {i}: object score {:6.2} ({}), mask area {area}  [{:.0?}]", r.object_score, if r.object_score > 0.0 { "present" } else { "absent" }, t.elapsed());
+        if let Some(out) = &a.out {
+            let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| format!("{i}"));
+            let buf: Vec<u8> = mask.data.iter().map(|&v| v * 255).collect();
+            image::GrayImage::from_raw(mask.width as u32, mask.height as u32, buf).context("mask buffer")?.save(std::path::Path::new(out).join(format!("{name}_mask.png")))?;
+        }
+    }
+    eprintln!("{} frames in {:.2?}", files.len() - a.prompt_frame, t_all.elapsed());
+    Ok(())
+}

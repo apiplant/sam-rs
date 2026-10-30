@@ -1,0 +1,48 @@
+[package]
+name = "sam-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Rust (candle) inference for Segment Anything models (SAM, MobileSAM, EfficientSAM, SAM 2, SAM 3) on CPU and CUDA"
+license = "Apache-2.0"
+repository = "https://github.com/apiplant/sam-rs"
+readme = "README.md"
+keywords = ["sam","segment-anything","segmentation","candle","vision"]
+categories = ["science","computer-vision","command-line-utilities"]
+
+[lib]
+name = "sam_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sam-rs"
+path = "src/main.rs"
+
+[features]
+default = []
+# GPU support is opt-in, so depending on this crate never pulls in a CUDA toolchain: enable it from your
+# own Cargo.toml with `features = ["cuda"]`.
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+# FlashAttention-2 for the SAM 3 vision tower (long first build).
+flash-attn = ["cuda", "dep:candle-flash-attn"]
+
+[dependencies]
+anyhow = "1"
+candle-core = "0.11"
+candle-nn = "0.11"
+candle-flash-attn = { version = "0.11", optional = true }
+clap = { version = "4", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "bmp"] }
+half = "2"
+rayon = "1"
+libm = "0.2"
+gemm = "0.19"
+tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = "2"
+
+[profile.release]
+opt-level = 3
+
+[dev-dependencies]
+candle-transformers = { version = "0.11", default-features = false }
