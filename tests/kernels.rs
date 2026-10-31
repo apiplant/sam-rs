@@ -60,3 +60,24 @@ fn qkv_split_and_bias_ops_match_fallback() -> Result<()> {
     assert!(max_abs_diff(&bias_gelu(&on(&y)?, &on(&bias)?)?, &bias_gelu(&y, &bias)?)? < 2e-2);
     Ok(())
 }
+
+#[test]
+fn deform_attn_matches_cpu() -> Result<()> {
+    use sam_rs::kernels::deform_attn;
+    let Some(g) = gpu() else { return Ok(()) };
+    let shapes = [(9usize, 12usize), (5, 6), (3, 3), (2, 2)];
+    let s: usize = shapes.iter().map(|(h, w)| h * w).sum();
+    let (b, q, h, d, l, p) = (1usize, 37usize, 8usize, 32usize, 4usize, 4usize);
+    let value = rand(&[b, s, h, d], &Device::Cpu)?;
+    // sampling locations spread beyond [0, 1] so the zero padding is exercised
+    let loc = (rand(&[b, q, h, l, p, 2], &Device::Cpu)? * 0.5)?.affine(1.0, 0.5)?;
+    let attn = candle_nn::ops::softmax_last_dim(&rand(&[b, q, h, l * p], &Device::Cpu)?)?.reshape((b, q, h, l, p))?;
+    let want = deform_attn(&value, &loc, &attn, &shapes)?;
+    for dt in [DType::F32, DType::F16] {
+        let got = deform_attn(&value.to_device(&g)?.to_dtype(dt)?, &loc.to_device(&g)?.to_dtype(dt)?, &attn.to_device(&g)?.to_dtype(dt)?, &shapes)?;
+        let tol = if dt == DType::F32 { 1e-4 } else { 5e-2 };
+        let e = max_abs_diff(&got, &want)?;
+        assert!(e < tol, "{dt:?}: max diff {e}");
+    }
+    Ok(())
+}

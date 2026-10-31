@@ -81,13 +81,30 @@ export function Toggle(props: { checked: boolean; onChange: (v: boolean) => void
   );
 }
 
-export function Slider(props: { label: string; value: number; min: number; max: number; step: number; digits?: number; onChange: (v: number) => void }) {
+export function Slider(props: { label: string; value: number; min: number; max: number; step: number; digits?: number; /** show an editable number box instead of the read-out */ numeric?: boolean; onChange: (v: number) => void }) {
   const fill = () => `${((props.value - props.min) / (props.max - props.min)) * 100}%`;
   return (
     <label class="block py-1.5">
       <span class="mb-0.5 flex justify-between text-ink-300">
         {props.label}
-        <span class="font-mono text-[12px] text-ink-100">{props.value.toFixed(props.digits ?? 2)}</span>
+        <Show when={props.numeric} fallback={<span class="font-mono text-[12px] text-ink-100">{props.value.toFixed(props.digits ?? 2)}</span>}>
+          <input
+            class="h-6 w-[68px] rounded-md border border-ink-700 bg-ink-850 px-1.5 text-right font-mono text-[12px] text-ink-100 hover:border-ink-600 focus:border-accent focus:outline-none"
+            type="number"
+            min={props.min}
+            max={props.max}
+            step={props.step}
+            value={props.value.toFixed(props.digits ?? 2)}
+            aria-label={props.label}
+            onChange={(e) => {
+              // a typed value may be any number in range, not just a multiple of the slider's step
+              const v = parseFloat(e.currentTarget.value);
+              const shown = Number.isFinite(v) ? Math.min(props.max, Math.max(props.min, v)) : props.value;
+              if (Number.isFinite(v)) props.onChange(shown);
+              e.currentTarget.value = shown.toFixed(props.digits ?? 2);
+            }}
+          />
+        </Show>
       </span>
       <input
         class={slider}

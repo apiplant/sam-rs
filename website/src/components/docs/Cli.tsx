@@ -33,6 +33,9 @@ sam-rs --model sam2.1-hiera-large --image truck.jpg --box 86,282,1710,851
 # SAM 3: every instance of a concept
 sam-rs --model sam3 --text "wheel" --image truck.jpg --threshold 0.5
 
+# text for any SAM: Grounding DINO finds the boxes, the SAM segments inside them
+sam-rs --model sam-vit-b --detector grounding-dino-tiny --image truck.jpg --text "a wheel. a truck." --out masks.png
+
 # video: a directory of frames, sorted by name
 sam-rs --model sam2.1-hiera-tiny --video frames/ --point 500,375 --out masks/
 sam-rs --model sam3 --video frames/ --text "wheel" --out masks/`}
@@ -44,11 +47,13 @@ sam-rs --model sam3 --video frames/ --text "wheel" --out masks/`}
         <FlagTable
           rows={[
             { flag: "--image FILE", meaning: "The image to segment (jpeg, png, webp, bmp). Not needed with --video." },
-            { flag: "--model NAME", meaning: <>sam-vit-b (default), sam-vit-l, sam-vit-h, mobile-sam, efficientsam-ti, efficientsam-s, sam2.1-hiera-&#123;tiny,small,base-plus,large&#125;, sam2-hiera-*, sam3.</> },
+            { flag: "--model NAME", meaning: <>sam-vit-b (default), sam-vit-l, sam-vit-h, mobile-sam, efficientsam-ti, efficientsam-s, sam2.1-hiera-&#123;tiny,small,base-plus,large&#125;, sam2-hiera-*, sam3, grounding-dino-tiny, grounding-dino-base (boxes only).</> },
             { flag: "--weights FILE", meaning: "Use this .safetensors checkpoint instead of the cached or downloaded one (Meta layout)." },
             { flag: "--point X,Y[,0]", meaning: "Point prompt in image pixels; a trailing 0 makes it a background point. Repeatable." },
             { flag: "--box X0,Y0,X1,Y1", meaning: "Box prompt in image pixels. With SAM 3 it is an exemplar box (\"find more like this\") and repeatable." },
             { flag: "--text TEXT", meaning: "SAM 3: find and segment every instance of this concept. With --video it starts text-prompted detect-and-track." },
+            { flag: "--detector NAME", meaning: <>grounding-dino-tiny or grounding-dino-base: with <IC>--text</IC>, Grounding DINO finds the boxes and <IC>--model</IC> (SAM, MobileSAM, EfficientSAM, SAM 2) segments inside each. Writes one mask per detection.</> },
+            { flag: "--box-threshold, --text-threshold", meaning: "Grounding DINO: minimum box score (0.35) and minimum token score for a word to label a box (0.25)." },
             { flag: "--neg-box BOX", meaning: "SAM 3: negative exemplar box. Repeatable." },
             { flag: "--threshold S", meaning: "SAM 3: minimum instance score for --text. Default 0.3." },
             { flag: "--tracker", meaning: "SAM 3: treat --point / --box as SAM-style prompts for one object instead of text or exemplars." },

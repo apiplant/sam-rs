@@ -57,6 +57,7 @@ curl -s -X POST --data-binary @frame00.jpg localhost:8080/v1/videos/$v/frames`} 
             { flag: "POST /v1/models/{id}/load", meaning: "Download and load a model, optionally from a local weights path. DELETE /v1/models/{id} unloads it." },
             { flag: "POST /v1/images?model=ID", meaning: "Embed an image (the body) and get a session id." },
             { flag: "POST /v1/images/{id}/segment", meaning: "Points, boxes, and for SAM 3 text and exemplar boxes. Masks come back as base64 grayscale PNGs with score, area and bbox." },
+            { flag: "POST /v1/detect?model=grounding-dino-tiny&text=...", meaning: "Text to boxes: the body is an image, the answer is boxes with scores and the words they matched. Or pass detector to /segment and the server segments inside them." },
             { flag: "POST /v1/videos, /v1/videos/{id}/frames", meaning: "Start tracking with points, a box or SAM 3 text, then post each frame in order." },
           ]}
         />

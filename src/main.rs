@@ -38,6 +38,16 @@ struct Args {
     /// SAM 3 --video: index of the frame the prompt belongs to (tracking runs forward from there)
     #[arg(long, default_value_t = 0)]
     prompt_frame: usize,
+    /// Text detector for SAM / MobileSAM / EfficientSAM / SAM 2: grounding-dino-tiny | grounding-dino-base. With --text,
+    /// Grounding DINO finds the boxes and the model segments inside each one
+    #[arg(long)]
+    detector: Option<String>,
+    /// Grounding DINO: minimum box score
+    #[arg(long, default_value_t = 0.35)]
+    box_threshold: f32,
+    /// Grounding DINO: minimum token score for a word to label a box
+    #[arg(long, default_value_t = 0.25)]
+    text_threshold: f32,
     /// SAM 3 --video --text: run the detector every N frames to find objects that appear later
     #[arg(long, default_value_t = 5)]
     detect_every: usize,
@@ -112,6 +122,12 @@ fn main() -> Result<()> {
     let a = Args::parse();
     if a.f32 {
         sam_rs::cpu_gemm::set_enabled(false);
+    }
+    if a.model.starts_with("grounding-dino") {
+        return run_dino(&a);
+    }
+    if a.detector.is_some() {
+        return run_grounded(&a);
     }
     if let Some(v) = sam_rs::efficientsam::Variant::parse(&a.model) {
         return run_efficientsam(&a, v);
@@ -590,7 +606,7 @@ fn run_sam3_text_video(a: &Args, text: &str, files: &[std::path::PathBuf]) -> Re
         let t = Instant::now();
         let img = image::open(path).with_context(|| format!("opening {}", path.display()))?.to_rgb8();
         let objects = tracker.step(&img)?;
-        let summary: Vec<String> = objects.iter().map(|o| format!("#{} area {}{}", o.id, o.mask.data.iter().filter(|&&v| v > 0).count(), if o.detection_score.is_some() { " (detected)" } else { "" })).collect();
+        let summary: Vec<String> = objects.iter().map(|o| format!("#{} {} area {}{}", o.id, o.label, o.mask.data.iter().filter(|&&v| v > 0).count(), if o.detection_score.is_some() { " (detected)" } else { "" })).collect();
         println!("frame {i}: {} object(s) [{}]  [{:.0?}]", objects.len(), summary.join(", "), t.elapsed());
         if let Some(out) = &a.out {
             let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| format!("{i}"));
@@ -601,5 +617,110 @@ fn run_sam3_text_video(a: &Args, text: &str, files: &[std::path::PathBuf]) -> Re
         }
     }
     eprintln!("{} frames in {:.2?}", files.len() - a.prompt_frame, t_all.elapsed());
+    Ok(())
+}
+
+fn dino_repo(name: &str) -> Result<&'static str> {
+    match name {
+        "grounding-dino-tiny" => Ok(sam_rs::dino::REPO_TINY),
+        "grounding-dino-base" => Ok(sam_rs::dino::REPO_BASE),
+        _ => bail!("unknown detector {name:?} (grounding-dino-tiny | grounding-dino-base)"),
+    }
+}
+
+fn load_dino(name: &str, a: &Args) -> Result<sam_rs::dino::GroundingDino> {
+    let device = if a.cpu { Device::Cpu } else { Device::cuda_if_available(0)? };
+    let t = Instant::now();
+    // f32: the detector is small, and f16 is no faster here
+    let m = sam_rs::dino::GroundingDino::from_repo(dino_repo(name)?, &device, DType::F32)?;
+    eprintln!("loaded {name} in {:.2?} on {:?}", t.elapsed(), device.location());
+    Ok(m)
+}
+
+/// Grounding DINO on its own: boxes for the phrases in `--text` ("a cat. a remote control.").
+fn run_dino(a: &Args) -> Result<()> {
+    let text = a.text.as_deref().context("--text \"a cat. a remote control.\" (phrases separated by full stops)")?;
+    let dino = load_dino(&a.model, a)?;
+    let img = image::open(&a.image).with_context(|| format!("opening {}", a.image))?.to_rgb8();
+    let t = Instant::now();
+    let dets = dino.detect(&img, text, a.box_threshold, a.text_threshold)?;
+    eprintln!("detect: {:.2?}", t.elapsed());
+    for d in &dets {
+        println!("{:.3} {:?} [{:.1}, {:.1}, {:.1}, {:.1}]", d.score, d.label, d.bbox[0], d.bbox[1], d.bbox[2], d.bbox[3]);
+    }
+    if dets.is_empty() {
+        println!("no boxes above --box-threshold {}", a.box_threshold);
+    }
+    if let Some(out) = &a.out {
+        let mut canvas = img.clone();
+        let colors = [[115u8, 224, 201], [124, 140, 255], [255, 180, 84], [255, 122, 156], [182, 227, 92]];
+        for (i, d) in dets.iter().enumerate() {
+            let c = image::Rgb(colors[i % colors.len()]);
+            let (x0, y0, x1, y1) = (d.bbox[0].max(0.0) as i32, d.bbox[1].max(0.0) as i32, (d.bbox[2] as i32).min(img.width() as i32 - 1), (d.bbox[3] as i32).min(img.height() as i32 - 1));
+            for t in 0..3 {
+                for x in x0..=x1 {
+                    for y in [y0 + t, y1 - t] {
+                        if y >= 0 && y < img.height() as i32 {
+                            canvas.put_pixel(x as u32, y as u32, c);
+                        }
+                    }
+                }
+                for y in y0..=y1 {
+                    for x in [x0 + t, x1 - t] {
+                        if x >= 0 && x < img.width() as i32 {
+                            canvas.put_pixel(x as u32, y as u32, c);
+                        }
+                    }
+                }
+            }
+        }
+        canvas.save(out)?;
+    }
+    Ok(())
+}
+
+/// Grounded segmentation: Grounding DINO turns `--text` into boxes and `--model` (SAM, MobileSAM, EfficientSAM or SAM 2)
+/// segments inside each. `--out FILE.png` writes one mask per detection (`FILE_1.png`, `FILE_2.png`, ...).
+fn run_grounded(a: &Args) -> Result<()> {
+    use sam_rs::{dino, efficientsam::EfficientSam, model::{Prompt, Sam, SamVariant}, sam2::Sam2};
+    let text = a.text.as_deref().context("--detector needs --text \"a cat. a remote control.\"")?;
+    let device = if a.cpu { Device::Cpu } else { Device::cuda_if_available(0)? };
+    let dtype = match (device.is_cuda(), a.dtype.as_str()) {
+        (true, "f16") => DType::F16,
+        _ => DType::F32,
+    };
+    let img = image::open(&a.image).with_context(|| format!("opening {}", a.image))?.to_rgb8();
+    let detector = load_dino(a.detector.as_deref().unwrap_or_default(), a)?;
+    let t = Instant::now();
+    let dets = detector.detect(&img, text, a.box_threshold, a.text_threshold)?;
+    eprintln!("detect: {:.2?} ({} boxes)", t.elapsed(), dets.len());
+    drop(detector);
+    let t = Instant::now();
+    let grounded = if let Some(v) = sam_rs::efficientsam::Variant::parse(&a.model) {
+        let m = EfficientSam::from_pretrained(v, &device, dtype)?;
+        let e = m.embed(&img)?;
+        dino::ground(dets, |b| m.predict(&e, &[], &[b]).map_err(Into::into))?
+    } else if let Some(v) = sam_rs::sam2::Sam2Variant::parse(&a.model) {
+        let m = Sam2::from_pretrained(v, &device, dtype)?;
+        let e = m.embed(&img)?;
+        dino::ground(dets, |b| Ok(m.predict(&e, &[], &[b], false)?.0))?
+    } else if a.model.starts_with("sam3") {
+        bail!("SAM 3 takes --text itself: drop --detector");
+    } else {
+        let v = SamVariant::parse(&a.model).with_context(|| format!("unknown model {}", a.model))?;
+        let m = Sam::from_pretrained(v, &device, dtype)?;
+        let e = m.embed(&img)?;
+        dino::ground(dets, |b| m.predict(&e, &Prompt::Box(b), false))?
+    };
+    eprintln!("segment: {:.2?}", t.elapsed());
+    for (i, (d, m)) in grounded.iter().enumerate() {
+        println!("{}: {:?} score {:.3}, mask iou {:.3}, area {}", i + 1, d.label, d.score, m.iou, m.data.iter().filter(|&&v| v > 0).count());
+        if let Some(out) = &a.out {
+            let p = std::path::Path::new(out);
+            let name = format!("{}_{}.png", p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "mask".into()), i + 1);
+            let buf: Vec<u8> = m.data.iter().map(|&v| v * 255).collect();
+            image::GrayImage::from_raw(m.width as u32, m.height as u32, buf).context("mask buffer")?.save(p.with_file_name(name))?;
+        }
+    }
     Ok(())
 }

@@ -120,6 +120,25 @@ export function Home() {
         </div>
       </section>
 
+      {/* The web UI */}
+      <section class="pb-16">
+        <h2 class="text-2xl font-semibold tracking-tight text-ink">A web UI included</h2>
+        <p class="mt-2 max-w-2xl text-muted">
+          <code class="font-mono text-[0.9em] text-ink">sam-rs serve</code> hosts the API and this interface from the one binary: pick a downloaded model,
+          click or drag to prompt, type phrases for text, and track objects through a clip.
+        </p>
+        <a href="/docs/serve" class="mt-8 block overflow-hidden rounded-xl border border-line shadow-2xl transition-colors hover:border-line-strong">
+          <img
+            src="/ui.webp"
+            width="1500"
+            height="757"
+            loading="lazy"
+            alt="The sam-rs web UI: a truck photo with two masks from Grounding DINO boxes and EfficientSAM, a model list on the left and per-instance scores on the right"
+            class="block h-auto w-full"
+          />
+        </a>
+      </section>
+
       {/* Cards */}
       <section class="pb-16">
         <h2 class="text-2xl font-semibold tracking-tight text-ink">{SITE.cardsTitle}</h2>

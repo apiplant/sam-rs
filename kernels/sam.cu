@@ -296,3 +296,55 @@ __device__ void dwconv3(const T* __restrict__ x, const T* __restrict__ w, const 
 DWCONV(f32, float)
 DWCONV(f16, __half)
 DWCONV(bf16, __nv_bfloat16)
+
+// ---------------------------------------------------------------------------------------------
+// Multi-scale deformable attention (Deformable DETR / Grounding DINO), forward only.
+//   value [B, S, H, D] (all levels concatenated), loc [B, Q, H, L, P, 2] in [0, 1] (x, y), attn [B, Q, H, L, P]
+//   out[b, q, h*D + d] = sum_{l,p} attn * bilinear(value_l[b, :, h, d], loc * (W_l, H_l) - 0.5), zeros outside
+// At most 4 levels; `hh*` / `ww*` are the level heights and widths.
+template <typename T>
+__device__ void deform_attn(const T* __restrict__ value, const T* __restrict__ loc, const T* __restrict__ attn,
+                            T* __restrict__ out, long total, int S, int Q, int H, int D, int L, int P, int hh0, int hh1,
+                            int hh2, int hh3, int ww0, int ww1, int ww2, int ww3) {
+  const int hh[4] = {hh0, hh1, hh2, hh3};
+  const int ww[4] = {ww0, ww1, ww2, ww3};
+  for (long idx = (long)blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += (long)gridDim.x * blockDim.x) {
+    const int d = (int)(idx % D);
+    long t = idx / D;
+    const int h = (int)(t % H);
+    t /= H;
+    const int q = (int)(t % Q);
+    const int b = (int)(t / Q);
+    float acc = 0.f;
+    int start = 0;
+    for (int l = 0; l < L; ++l) {
+      const int Hl = hh[l], Wl = ww[l];
+      for (int p = 0; p < P; ++p) {
+        const long base = ((((long)b * Q + q) * H + h) * L + l) * P + p;
+        const float w = to_f(attn[base]);
+        const float x = to_f(loc[base * 2]) * Wl - 0.5f, y = to_f(loc[base * 2 + 1]) * Hl - 0.5f;
+        const float xf = floorf(x), yf = floorf(y);
+        const int x0 = (int)xf, y0 = (int)yf;
+        const float fx = x - xf, fy = y - yf;
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+          const int xx = x0 + (c & 1), yy = y0 + (c >> 1);
+          if (xx < 0 || xx >= Wl || yy < 0 || yy >= Hl) continue;
+          const float wt = ((c & 1) ? fx : 1.f - fx) * ((c >> 1) ? fy : 1.f - fy);
+          acc += w * wt * to_f(value[(((long)b * S + start + (long)yy * Wl + xx) * H + h) * D + d]);
+        }
+      }
+      start += Hl * Wl;
+    }
+    out[idx] = from_f<T>(acc);
+  }
+}
+#define DEFORM(SUF, T)                                                                                              \
+  extern "C" __global__ void deform_attn_##SUF(const T* v, const T* loc, const T* attn, T* out, long total, int S,  \
+                                               int Q, int H, int D, int L, int P, int hh0, int hh1, int hh2,        \
+                                               int hh3, int ww0, int ww1, int ww2, int ww3) {                       \
+    deform_attn<T>(v, loc, attn, out, total, S, Q, H, D, L, P, hh0, hh1, hh2, hh3, ww0, ww1, ww2, ww3);            \
+  }
+DEFORM(f32, float)
+DEFORM(f16, __half)
+DEFORM(bf16, __nv_bfloat16)

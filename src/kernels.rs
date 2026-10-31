@@ -766,6 +766,72 @@ mod cpu {
             Ok((CpuStorage::F32(out), Shape::from((b, oh, ow, c))))
         }
     }
+
+    /// Multi-scale deformable attention, forward (see `kernels/sam.cu`): `value [B, S, H, D]`, `loc [B, Q, H, L, P, 2]`,
+    /// `attn [B, Q, H, L, P]` -> `[B, Q, H*D]`.
+    pub struct DeformAttn {
+        pub shapes: Vec<(usize, usize)>,
+    }
+
+    impl CustomOp3 for DeformAttn {
+        fn name(&self) -> &'static str {
+            "deform-attn"
+        }
+
+        fn cpu_fwd(&self, v: &CpuStorage, vl: &Layout, loc: &CpuStorage, ll: &Layout, attn: &CpuStorage, al: &Layout) -> Result<(CpuStorage, Shape)> {
+            let (v, loc, attn) = (f32s(v, vl)?, f32s(loc, ll)?, f32s(attn, al)?);
+            let (b, s, h, d) = vl.shape().dims4()?;
+            let dims = ll.shape().dims();
+            let (q, l, p) = (dims[1], dims[3], dims[4]);
+            let starts: Vec<usize> = self.shapes.iter().scan(0, |acc, (hh, ww)| { let st = *acc; *acc += hh * ww; Some(st) }).collect();
+            let mut out = vec![0f32; b * q * h * d];
+            out.par_chunks_mut(h * d).enumerate().for_each(|(bq, o)| {
+                let bi = bq / q;
+                for hi in 0..h {
+                    let acc = &mut o[hi * d..(hi + 1) * d];
+                    for li in 0..l {
+                        let (hl, wl) = self.shapes[li];
+                        for pi in 0..p {
+                            let base = ((bq * h + hi) * l + li) * p + pi;
+                            let w = attn[base];
+                            let x = loc[base * 2] * wl as f32 - 0.5;
+                            let y = loc[base * 2 + 1] * hl as f32 - 0.5;
+                            let (xf, yf) = (x.floor(), y.floor());
+                            let (x0, y0, fx, fy) = (xf as i64, yf as i64, x - xf, y - yf);
+                            for c in 0..4 {
+                                let (xx, yy) = (x0 + (c & 1), y0 + (c >> 1));
+                                if xx < 0 || xx >= wl as i64 || yy < 0 || yy >= hl as i64 {
+                                    continue;
+                                }
+                                let wt = w * (if c & 1 == 1 { fx } else { 1.0 - fx }) * (if c >> 1 == 1 { fy } else { 1.0 - fy });
+                                let src = &v[((bi * s + starts[li] + yy as usize * wl + xx as usize) * h + hi) * d..][..d];
+                                for (a, x) in acc.iter_mut().zip(src) {
+                                    *a += wt * x;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+            Ok((CpuStorage::F32(out), Shape::from((b, q, h * d))))
+        }
+    }
+}
+
+/// Multi-scale deformable attention: `value [B, S, H, D]` (the levels' pixels concatenated), `loc [B, Q, H, L, P, 2]`
+/// sampling locations in `[0, 1]` as `(x, y)`, `attn [B, Q, H, L, P]` weights -> `[B, Q, H*D]`. Bilinear sampling with zero
+/// padding, like `grid_sample(align_corners=False)`. `shapes`: `(height, width)` of each of the (at most 4) levels.
+pub fn deform_attn(value: &Tensor, loc: &Tensor, attn: &Tensor, shapes: &[(usize, usize)]) -> Result<Tensor> {
+    let (value, loc, attn) = (value.contiguous()?, loc.contiguous()?, attn.contiguous()?);
+    #[cfg(feature = "cuda")]
+    if value.device().is_cuda() {
+        return value.apply_op3_no_bwd(&loc, &attn, &cuda::DeformAttn { shapes: shapes.to_vec() });
+    }
+    if value.dtype() != candle_core::DType::F32 {
+        let f = |t: &Tensor| t.to_dtype(candle_core::DType::F32);
+        return deform_attn(&f(&value)?, &f(&loc)?, &f(&attn)?, shapes)?.to_dtype(value.dtype());
+    }
+    value.apply_op3_no_bwd(&loc, &attn, &cpu::DeformAttn { shapes: shapes.to_vec() })
 }
 
 /// `y: [T, 3C]` (qkv projection output without bias) + `bias[3C]` -> `[3, T, C]`: q, k, v planes with the bias added.
@@ -1080,6 +1146,51 @@ mod cuda {
     }
     fn run_relpos<T: CudaDType + WithDType + candle_core::cuda_backend::cudarc::driver::DeviceRepr>(op: &RelposSoftmax, dev: &CudaDevice, s: &CudaStorage, sl: &Layout, q: &CudaStorage, ql: &Layout, t: &CudaStorage, tl: &Layout) -> Result<CudaStorage> {
         op.run::<T>(dev, s, sl, q, ql, t, tl)
+    }
+
+    pub struct DeformAttn {
+        pub shapes: Vec<(usize, usize)>,
+    }
+
+    impl CustomOp3 for DeformAttn {
+        fn name(&self) -> &'static str {
+            "deform-attn"
+        }
+        fn cpu_fwd(&self, _: &CpuStorage, _: &Layout, _: &CpuStorage, _: &Layout, _: &CpuStorage, _: &Layout) -> Result<(CpuStorage, Shape)> {
+            bail!("the CUDA deform-attn op ran on the CPU")
+        }
+        fn cuda_fwd(&self, v: &CudaStorage, vl: &Layout, loc: &CudaStorage, ll: &Layout, a: &CudaStorage, al: &Layout) -> Result<(CudaStorage, Shape)> {
+            let dev = v.device().clone();
+            let (b, _, h, d) = vl.shape().dims4()?;
+            let q = ll.shape().dims()[1];
+            let out = by_dtype!(v.dtype(), run_deform(self, &dev, v, vl, loc, ll, a, al))?;
+            Ok((out, Shape::from((b, q, h * d))))
+        }
+    }
+    fn run_deform<T: CudaDType + WithDType + candle_core::cuda_backend::cudarc::driver::DeviceRepr>(op: &DeformAttn, dev: &CudaDevice, v: &CudaStorage, vl: &Layout, loc: &CudaStorage, ll: &Layout, a: &CudaStorage, al: &Layout) -> Result<CudaStorage> {
+        let (vv, lv, av) = (view::<T>(v, vl)?, view::<T>(loc, ll)?, view::<T>(a, al)?);
+        let (b, s, h, d) = vl.shape().dims4()?;
+        let dims = ll.shape().dims();
+        let (q, l, p) = (dims[1], dims[3], dims[4]);
+        if l > 4 {
+            bail!("deform-attn supports at most 4 levels, got {l}");
+        }
+        let total = b * q * h * d;
+        let func = dev.get_or_load_custom_func(&kernel_name::<T>("deform_attn"), "sam", PTX)?;
+        let out = unsafe { dev.alloc::<T>(total)? };
+        let mut hw = [1i32; 8];
+        for (i, (hh, ww)) in op.shapes.iter().enumerate() {
+            hw[i] = *hh as i32;
+            hw[4 + i] = *ww as i32;
+        }
+        let (tot, s, q, h, d, l, p) = (total as i64, s as i32, q as i32, h as i32, d as i32, l as i32, p as i32);
+        let mut bld = func.builder();
+        bld.arg(&vv).arg(&lv).arg(&av).arg(&out).arg(&tot).arg(&s).arg(&q).arg(&h).arg(&d).arg(&l).arg(&p);
+        for x in &hw {
+            bld.arg(x);
+        }
+        unsafe { bld.launch(grid(total)) }.w()?;
+        Ok(CudaStorage::wrap_cuda_slice(out, dev.clone()))
     }
 
     pub struct QkvSplit {

@@ -18,7 +18,7 @@ export const SITE = {
   bins: ["sam-rs"],
   badges: ["Rust", "candle", "CUDA", "Apache-2.0"],
   hero: { pre: "Segment Anything, ", accent: "in Rust", post: "." },
-  lead: "Click a point, draw a box or name a concept and get masks back: SAM, MobileSAM, EfficientSAM, SAM 2 and SAM 3 from one binary and one library, on CPU or CUDA, with video tracking. No Python.",
+  lead: "Click a point, draw a box or name a concept and get masks back: SAM, MobileSAM, EfficientSAM, SAM 2 and SAM 3, plus Grounding DINO for text on any of them, from one binary and one library, on CPU or CUDA, with video tracking. No Python.",
   heroNote: "Checkpoints download from Hugging Face on first run (SAM 3 is gated and needs an HF_TOKEN).",
   demo: null as { href: string; label: string } | null,
   cargo: `cargo install sam-rs                          # CPU only (bf16 kernels where the CPU has them)
@@ -62,6 +62,10 @@ mask 2: iou 0.493, area 46080`,
     {
       title: "SAM 3 concepts",
       body: "Type \"truck\" or \"wheel\" and get every instance with a score, a box and a mask. Exemplar boxes (positive and negative) work too.",
+    },
+    {
+      title: "Text for every SAM",
+      body: "Grounding DINO turns phrases into boxes and any SAM, MobileSAM, EfficientSAM or SAM 2 segments inside them: Grounded-SAM, from one binary, checked against PyTorch.",
     },
     {
       title: "Video tracking",

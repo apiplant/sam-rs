@@ -27,6 +27,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
+use crate::dino::{self, GroundingDino};
 use crate::efficientsam::{self, EfficientSam};
 use crate::model::{self, Prompt, Sam, SamVariant};
 use crate::sam2::{self, Sam2, Sam2Variant};
@@ -41,6 +42,8 @@ enum Kind {
     Efficient(efficientsam::Variant),
     Sam2(Sam2Variant),
     Sam3,
+    /// a text-to-boxes detector (Grounding DINO); not a segmenter
+    Dino(&'static str),
 }
 
 struct Spec {
@@ -55,9 +58,10 @@ struct Spec {
 impl Spec {
     fn caps(&self) -> Value {
         match self.kind {
-            Kind::Sam(_) | Kind::Efficient(_) => json!({ "points": true, "boxes": true, "text": false, "text_via_detector": true, "exemplars": false, "video": false }),
-            Kind::Sam2(_) => json!({ "points": true, "boxes": true, "text": false, "text_via_detector": true, "exemplars": false, "video": true }),
+            Kind::Sam(_) | Kind::Efficient(_) => json!({ "points": true, "boxes": true, "text": false, "exemplars": false, "video": false }),
+            Kind::Sam2(_) => json!({ "points": true, "boxes": true, "text": false, "exemplars": false, "video": true }),
             Kind::Sam3 => json!({ "points": true, "boxes": true, "text": true, "exemplars": true, "video": true }),
+            Kind::Dino(_) => json!({ "points": false, "boxes": false, "text": true, "exemplars": false, "video": false, "detector": true }),
         }
     }
 
@@ -75,6 +79,7 @@ impl Spec {
                 cached(&repo, "model.safetensors").is_some() && cached(&repo, "config.json").is_some()
             }
             Kind::Sam3 => cached(sam3::REPO, "model.safetensors").is_some() && cached(sam3::REPO, "tokenizer.json").is_some(),
+            Kind::Dino(repo) => ["model.safetensors", "config.json", "tokenizer.json"].iter().all(|f| cached(repo, f).is_some()),
         }
     }
 }
@@ -85,24 +90,30 @@ fn catalog() -> Vec<Spec> {
         let kind = parse_kind(id).expect("catalog ids parse");
         v.push(Spec { id: id.into(), name: name.into(), family, kind, size_mb, gated });
     };
+    // the order of the picker: SAM 3, SAM 2.1 (heaviest first), SAM 2, then the rest
+    add("sam3", "SAM 3", "SAM 3", 3400, true);
+    for (gen, label) in [("sam2.1", "SAM 2.1"), ("sam2", "SAM 2")] {
+        for (size, name, mb) in [("large", "Large", 898), ("base-plus", "Base+", 323), ("small", "Small", 185), ("tiny", "Tiny", 160)] {
+            add(&format!("{gen}-hiera-{size}"), &format!("{label} Hiera {name}"), label, mb, false);
+        }
+    }
     add("sam-vit-b", "SAM ViT-B", "SAM", 375, false);
     add("sam-vit-l", "SAM ViT-L", "SAM", 1250, false);
     add("sam-vit-h", "SAM ViT-H", "SAM", 2560, false);
     add("mobile-sam", "MobileSAM", "MobileSAM", 40, false);
     add("efficientsam-ti", "EfficientSAM ViT-Tiny", "EfficientSAM", 41, false);
     add("efficientsam-s", "EfficientSAM ViT-Small", "EfficientSAM", 106, false);
-    for (gen, label) in [("sam2.1", "SAM 2.1"), ("sam2", "SAM 2")] {
-        for (size, name, mb) in [("tiny", "Tiny", 160), ("small", "Small", 185), ("base-plus", "Base+", 323), ("large", "Large", 898)] {
-            add(&format!("{gen}-hiera-{size}"), &format!("{label} Hiera {name}"), "SAM 2", mb, false);
-        }
-    }
-    add("sam3", "SAM 3", "SAM 3", 3400, true);
+    add("grounding-dino-tiny", "Grounding DINO Tiny", "Grounding DINO", 690, false);
+    add("grounding-dino-base", "Grounding DINO Base", "Grounding DINO", 940, false);
     v
 }
 
 fn parse_kind(id: &str) -> Option<Kind> {
-    if id == "sam3" {
-        return Some(Kind::Sam3);
+    match id {
+        "sam3" => return Some(Kind::Sam3),
+        "grounding-dino-tiny" => return Some(Kind::Dino(dino::REPO_TINY)),
+        "grounding-dino-base" => return Some(Kind::Dino(dino::REPO_BASE)),
+        _ => {}
     }
     SamVariant::parse(id)
         .map(Kind::Sam)
@@ -151,6 +162,7 @@ enum Model {
     Efficient(EfficientSam),
     Sam2(Sam2),
     Sam3(Sam3),
+    Dino(GroundingDino),
 }
 
 enum Emb {
@@ -167,9 +179,8 @@ struct ImageSession {
     width: usize,
     height: usize,
     emb: Emb,
-    /// the image itself and, once a text prompt needed it, SAM 3's detector features for it
+    /// kept for the text detector, which looks at the image itself
     img: RgbImage,
-    detector: Option<Box<sam3::ImageFeatures>>,
 }
 
 #[derive(Default, Clone)]
@@ -178,7 +189,49 @@ struct VideoPrompt {
     boxes: Vec<[f32; 4]>,
 }
 
+/// One object followed by its own SAM 2 session, found by a text detector.
+struct GroundedTrack {
+    id: usize,
+    label: String,
+    session: Session,
+    missing: usize,
+}
+
+/// Text-prompted tracking for SAM 2 (which has no text input): Grounding DINO finds the objects on the first frame and
+/// then every `detect_every` frames, each new one starts a SAM 2 session seeded with its box, and a track absent for
+/// 8 frames in a row is dropped.
+struct Grounded {
+    text: String,
+    box_threshold: f32,
+    text_threshold: f32,
+    detect_every: usize,
+    tracks: Vec<GroundedTrack>,
+    next_id: usize,
+}
+
+fn box_iou(a: &[f32; 4], b: &[f32; 4]) -> f32 {
+    let (x0, y0, x1, y1) = (a[0].max(b[0]), a[1].max(b[1]), a[2].min(b[2]), a[3].min(b[3]));
+    let inter = (x1 - x0).max(0.0) * (y1 - y0).max(0.0);
+    let area = |r: &[f32; 4]| (r[2] - r[0]).max(0.0) * (r[3] - r[1]).max(0.0);
+    inter / (area(a) + area(b) - inter).max(1e-9)
+}
+
+fn mask_bbox(m: &Mask) -> Option<[f32; 4]> {
+    let (mut x0, mut y0, mut x1, mut y1) = (usize::MAX, usize::MAX, 0usize, 0usize);
+    for (y, row) in m.data.chunks(m.width.max(1)).enumerate() {
+        if let Some(first) = row.iter().position(|&v| v > 0) {
+            let last = row.iter().rposition(|&v| v > 0).unwrap_or(first);
+            x0 = x0.min(first);
+            x1 = x1.max(last);
+            y0 = y0.min(y);
+            y1 = y1.max(y);
+        }
+    }
+    (x0 != usize::MAX).then_some([x0 as f32, y0 as f32, x1 as f32 + 1.0, y1 as f32 + 1.0])
+}
+
 enum Tracking {
+    Grounded(Grounded),
     Sam2(Session),
     Sam3(Session),
     Text(TextState),
@@ -187,6 +240,8 @@ enum Tracking {
 struct VideoSession {
     id: u64,
     model: String,
+    /// the text detector of a grounded session
+    detector: Option<String>,
     frame: usize,
     prompt: VideoPrompt,
     tracking: Tracking,
@@ -254,6 +309,8 @@ impl State {
             (Kind::Sam2(_), Some(w)) => Model::Sam2(Sam2::from_dir(&beside(w, "config.json")?, w, &device, dtype)?),
             (Kind::Sam2(v), None) => Model::Sam2(Sam2::from_pretrained(v, &device, dtype)?),
             (Kind::Sam3, Some(w)) => Model::Sam3(Sam3::from_file(w, &beside(w, "tokenizer.json")?, &device, dtype)?),
+            (Kind::Dino(repo), None) => Model::Dino(GroundingDino::from_repo(repo, &device, DType::F32)?),
+            (Kind::Dino(_), Some(w)) => Model::Dino(GroundingDino::from_file(&beside(w, "config.json")?, w, &beside(w, "tokenizer.json")?, &device, DType::F32)?),
             (Kind::Sam3, None) => Model::Sam3(Sam3::from_pretrained(&device, dtype).context("loading SAM 3 (the weights are gated: set HF_TOKEN, see the README)")?),
         };
         eprintln!("loaded {id} in {:.2?}", t.elapsed());
@@ -314,6 +371,9 @@ impl State {
     // ---- images
 
     fn embed(&mut self, model: &str, bytes: &[u8]) -> Result<Value> {
+        if matches!(Self::spec(model)?.kind, Kind::Dino(_)) {
+            return Err(bad(format!("{model} is a text-to-boxes detector, not a segmenter: use it as the `detector` of a SAM model, or through /v1/detect")));
+        }
         self.ensure(model, None)?;
         let img = decode(bytes)?;
         let (w, h) = (img.width() as usize, img.height() as usize);
@@ -323,11 +383,12 @@ impl State {
             Model::Efficient(m) => Emb::Efficient(m.embed(&img)?),
             Model::Sam2(m) => Emb::Sam2(m.embed(&img)?),
             Model::Sam3(m) => Emb::Sam3(Box::new(m.encode_image(&img)?), None),
+            Model::Dino(_) => unreachable!("detectors are rejected above"),
         };
         sync(self.model(model)?)?;
         let ms = t.elapsed().as_secs_f64() * 1e3;
         let id = self.new_id();
-        self.images.push(ImageSession { id, model: model.to_string(), width: w, height: h, emb, img, detector: None });
+        self.images.push(ImageSession { id, model: model.to_string(), width: w, height: h, emb, img });
         if self.images.len() > MAX_IMAGES {
             self.images.remove(0);
         }
@@ -340,9 +401,16 @@ impl State {
         self.ensure(&model_id, None)?;
         let pos = self.images.iter().position(|s| s.id == id).ok_or_else(|| missing("image session was dropped"))?;
         let (w, h) = (self.images[pos].width, self.images[pos].height);
-        let text_only = req.text.as_deref().is_some_and(|t| !t.trim().is_empty()) && req.points.is_empty() && req.boxes.is_empty() && req.neg_boxes.is_empty();
-        if text_only && model_id != "sam3" {
-            return self.segment_by_text(id, &model_id, req.text.as_deref().unwrap_or("").trim(), req.threshold.unwrap_or(0.3));
+        if let Some(det) = req.detector.as_deref().filter(|d| !d.is_empty()) {
+            let text = req.text.as_deref().map(str::trim).unwrap_or("");
+            if text.is_empty() {
+                return Err(bad("a detector needs `text` to look for"));
+            }
+            if !req.points.is_empty() || !req.boxes.is_empty() || !req.neg_boxes.is_empty() {
+                return Err(bad("with a detector the prompt is the text alone: drop the points and boxes"));
+            }
+            let (det, text) = (det.to_string(), text.to_string());
+            return self.segment_grounded(id, &model_id, &det, &text, req.threshold.unwrap_or(0.35), req.text_threshold.unwrap_or(0.25));
         }
         let points: Vec<(f32, f32, bool)> = req.points.iter().map(|p| (p.x, p.y, p.label.unwrap_or(1) != 0)).collect();
         let boxes = req.boxes.clone();
@@ -395,13 +463,21 @@ impl State {
                     if text.is_empty() && exemplars.is_empty() {
                         return Err(bad("SAM 3 needs text and/or exemplar boxes (or points for the tracker)"));
                     }
-                    let prompt = if text.is_empty() { "visual" } else { text };
                     kind = "instances";
-                    entries = m
-                        .segment_with(f, prompt, &exemplars, req.threshold.unwrap_or(0.3))?
-                        .into_iter()
-                        .map(|i| Entry { score: i.score, mask: i.mask, id: None, present: true })
-                        .collect();
+                    // "wheel. person in red": each concept is detected on its own and the results are pooled
+                    let mut wanted = sam3::text_track::concepts(text);
+                    if wanted.is_empty() {
+                        wanted.push("visual".to_string());
+                    }
+                    let multi = wanted.len() > 1;
+                    let mut found = vec![];
+                    for c in &wanted {
+                        for i in m.segment_with(f, c, &exemplars, req.threshold.unwrap_or(0.3))? {
+                            found.push(Entry { label: multi.then(|| c.clone()), score: i.score, mask: i.mask, id: None, present: true });
+                        }
+                    }
+                    found.sort_by(|a, b| b.score.total_cmp(&a.score));
+                    entries = found;
                 }
             }
             _ => return Err(bad("the image session does not match the loaded model")),
@@ -415,43 +491,61 @@ impl State {
         }))
     }
 
-    /// Text prompts for models that have no text pathway (SAM, MobileSAM, EfficientSAM, SAM 2): SAM 3 finds the
-    /// instances of the phrase, and `model_id` segments inside each detected box.
-    fn segment_by_text(&mut self, id: u64, model_id: &str, text: &str, threshold: f32) -> Result<Value> {
-        if self.cfg.max_models < 2 {
-            return Err(bad("text prompts for this model use SAM 3 as the detector, which needs --max-models 2 or more"));
+    /// Grounded segmentation: `detector` (Grounding DINO) turns `text` into boxes, and the session's model segments inside
+    /// each one.
+    fn segment_grounded(&mut self, id: u64, model_id: &str, detector: &str, text: &str, box_threshold: f32, text_threshold: f32) -> Result<Value> {
+        if !matches!(Self::spec(detector)?.kind, Kind::Dino(_)) {
+            return Err(bad(format!("{detector} is not a text detector (use grounding-dino-tiny or grounding-dino-base)")));
         }
-        self.ensure("sam3", None).context("text prompts for this model use SAM 3 to find the objects first")?;
-        self.ensure(model_id, None)?; // SAM 3 may have pushed the other model out; this also makes it the most recent
+        if matches!(Self::spec(model_id)?.kind, Kind::Sam3) {
+            return Err(bad("SAM 3 takes text natively: leave `detector` out"));
+        }
+        if self.cfg.max_models < 2 {
+            return Err(bad("a detector needs --max-models 2 or more (the detector and the segmenter are both loaded)"));
+        }
+        self.ensure(model_id, None)?;
+        self.ensure(detector, None)?;
+        self.ensure(model_id, None)?; // the detector may have pushed the segmenter out of the LRU: touch it back in
         let pos = self.images.iter().position(|s| s.id == id).ok_or_else(|| missing("image session was dropped (the model was reloaded)"))?;
         let (w, h) = (self.images[pos].width, self.images[pos].height);
         let t = Instant::now();
         let State { models, images, .. } = self;
         let find = |name: &str| models.iter().find(|(m, _)| m == name).map(|(_, m)| m);
-        let (Some(Model::Sam3(det)), Some(model)) = (find("sam3"), find(model_id)) else { return Err(missing("a model was unloaded while the request ran")) };
-        let sess = &mut images[pos];
-        if sess.detector.is_none() {
-            sess.detector = Some(Box::new(det.encode_image(&sess.img)?));
-        }
-        let found = det.segment(sess.detector.as_ref().expect("just set"), text, threshold)?;
-        let mut entries = vec![];
-        for inst in found.into_iter().take(32) {
-            let b = inst.bbox;
-            let masks = match (model, &sess.emb) {
-                (Model::Sam(m), Emb::Sam(e)) => m.predict(e, &Prompt::Box(b), false)?,
-                (Model::Efficient(m), Emb::Efficient(e)) => m.predict(e, &[], &[b])?,
-                (Model::Sam2(m), Emb::Sam2(e)) => m.predict(e, &[], &[b], false)?.0,
-                _ => return Err(bad("the image session does not match the loaded model")),
-            };
-            if let Some(best) = masks.into_iter().max_by(|a, b| a.iou.total_cmp(&b.iou)) {
-                entries.push(Entry { score: inst.score, mask: best, id: None, present: true });
-            }
-        }
+        let (Some(Model::Dino(dino)), Some(model)) = (find(detector), find(model_id)) else { return Err(missing("a model was unloaded while the request ran")) };
+        let sess = &images[pos];
+        let dets = dino.detect(&sess.img, text, box_threshold, text_threshold)?;
+        let n_boxes = dets.len();
+        let grounded = dino::ground(dets.into_iter().take(50).collect(), |b| match (model, &sess.emb) {
+            (Model::Sam(m), Emb::Sam(e)) => m.predict(e, &Prompt::Box(b), false),
+            (Model::Efficient(m), Emb::Efficient(e)) => m.predict(e, &[], &[b]),
+            (Model::Sam2(m), Emb::Sam2(e)) => Ok(m.predict(e, &[], &[b], false)?.0),
+            _ => Err(bad("the image session does not match the loaded model")),
+        })?;
         sync(model)?;
+        let entries: Vec<Entry> = grounded.into_iter().map(|(d, mask)| Entry { label: Some(d.label), score: d.score, mask, id: None, present: true }).collect();
         Ok(json!({
-            "kind": "instances", "model": model_id, "detector": "sam3", "width": w, "height": h,
-            "object_score": null, "decode_ms": t.elapsed().as_secs_f64() * 1e3,
+            "kind": "instances", "model": model_id, "detector": detector, "width": w, "height": h,
+            "object_score": null, "detections": n_boxes, "decode_ms": t.elapsed().as_secs_f64() * 1e3,
             "results": entries.iter().map(Entry::json).collect::<Vec<_>>(),
+        }))
+    }
+
+    /// Text-to-boxes with a Grounding DINO model, no segmentation.
+    fn detect(&mut self, model: &str, text: &str, box_threshold: f32, text_threshold: f32, bytes: &[u8]) -> Result<Value> {
+        if !matches!(Self::spec(model)?.kind, Kind::Dino(_)) {
+            return Err(bad(format!("{model} is not a detector (use grounding-dino-tiny or grounding-dino-base)")));
+        }
+        if text.trim().is_empty() {
+            return Err(bad("need ?text=a cat. a remote control."));
+        }
+        self.ensure(model, None)?;
+        let img = decode(bytes)?;
+        let t = Instant::now();
+        let Model::Dino(m) = self.model(model)? else { return Err(missing("model unloaded")) };
+        let dets = m.detect(&img, text, box_threshold, text_threshold)?;
+        Ok(json!({
+            "model": model, "width": img.width(), "height": img.height(), "elapsed_ms": t.elapsed().as_secs_f64() * 1e3,
+            "detections": dets.iter().map(|d| json!({ "bbox": d.bbox, "score": d.score, "label": d.label })).collect::<Vec<_>>(),
         }))
     }
 
@@ -463,8 +557,33 @@ impl State {
             return Err(bad(format!("{} has no video tracking", req.model)));
         }
         self.ensure(&req.model, None)?;
+        let text = req.text.as_deref().map(str::trim).unwrap_or("").to_string();
+        let no_geometry = req.points.is_empty() && req.boxes.is_empty();
+        if let Some(det) = req.detector.as_deref().filter(|d| !d.is_empty()) {
+            if !matches!(spec.kind, Kind::Sam2(_)) {
+                return Err(bad(if matches!(spec.kind, Kind::Sam3) { "SAM 3 takes text natively: leave `detector` out" } else { "tracking by text with a detector needs a SAM 2 model" }));
+            }
+            if !matches!(Self::spec(det)?.kind, Kind::Dino(_)) {
+                return Err(bad(format!("{det} is not a text detector (use grounding-dino-tiny or grounding-dino-base)")));
+            }
+            if text.is_empty() || !no_geometry {
+                return Err(bad("with a detector the prompt is the text alone: give `text`, and no points or boxes"));
+            }
+            if self.cfg.max_models < 2 {
+                return Err(bad("a detector needs --max-models 2 or more"));
+            }
+            self.ensure(det, None)?;
+            self.ensure(&req.model, None)?;
+            let g = Grounded { text, box_threshold: req.threshold.unwrap_or(0.35), text_threshold: req.text_threshold.unwrap_or(0.25), detect_every: req.detect_every.unwrap_or(5).max(1), tracks: vec![], next_id: 0 };
+            let id = self.new_id();
+            self.videos.push(VideoSession { id, model: req.model.clone(), detector: Some(det.to_string()), frame: 0, prompt: VideoPrompt::default(), tracking: Tracking::Grounded(g) });
+            if self.videos.len() > MAX_VIDEOS {
+                self.videos.remove(0);
+            }
+            return Ok(json!({ "id": id, "model": req.model, "detector": det }));
+        }
         let prompt = VideoPrompt { points: req.points.iter().map(|p| (p.x, p.y, p.label.unwrap_or(1) != 0)).collect(), boxes: req.boxes.clone() };
-        let text = req.text.as_deref().map(str::trim).unwrap_or("");
+        let text = text.as_str();
         let tracking = match spec.kind {
             Kind::Sam2(_) => {
                 if prompt.points.is_empty() && prompt.boxes.is_empty() {
@@ -484,7 +603,7 @@ impl State {
             _ => unreachable!("video capability checked"),
         };
         let id = self.new_id();
-        self.videos.push(VideoSession { id, model: req.model.clone(), frame: 0, prompt, tracking });
+        self.videos.push(VideoSession { id, model: req.model.clone(), detector: None, frame: 0, prompt, tracking });
         if self.videos.len() > MAX_VIDEOS {
             self.videos.remove(0);
         }
@@ -494,23 +613,63 @@ impl State {
     fn video_frame(&mut self, id: u64, bytes: &[u8]) -> Result<Value> {
         let pos = self.videos.iter().position(|s| s.id == id).ok_or_else(|| missing(format!("video session {id} not found")))?;
         let model_id = self.videos[pos].model.clone();
+        let detector = self.videos[pos].detector.clone();
         self.ensure(&model_id, None)?;
+        if let Some(d) = &detector {
+            self.ensure(d, None)?;
+            self.ensure(&model_id, None)?; // the detector may have pushed the tracker out of the LRU: touch it back in
+        }
         let pos = self.videos.iter().position(|s| s.id == id).ok_or_else(|| missing("video session was dropped"))?;
         let img = decode(bytes)?;
         let orig = (img.height() as usize, img.width() as usize);
         let t = Instant::now();
         let State { models, videos, .. } = self;
         let m = models.iter().find(|(m, _)| *m == model_id).map(|(_, m)| m).ok_or_else(|| missing("model unloaded"))?;
+        let det_model = detector.as_deref().and_then(|d| models.iter().find(|(n, _)| n == d).map(|(_, m)| m));
         let v = &mut videos[pos];
         let first = v.frame == 0;
         let entries: Vec<Entry> = match (m, &mut v.tracking) {
+            (Model::Sam2(m), Tracking::Grounded(g)) => {
+                let Some(Model::Dino(d)) = det_model else { return Err(missing("the detector was unloaded")) };
+                let e = m.embed(&img)?;
+                let mut out: Vec<Entry> = vec![];
+                for tr in &mut g.tracks {
+                    let r = m.track_frame(&mut tr.session, &e)?;
+                    if r.object_score > 0.0 {
+                        tr.missing = 0;
+                        out.push(Entry { label: Some(tr.label.clone()), score: r.object_score, mask: m.frame_mask(&r, orig)?, id: Some(tr.id), present: true });
+                    } else {
+                        tr.missing += 1;
+                    }
+                }
+                if v.frame % g.detect_every == 0 {
+                    for det in d.detect(&img, &g.text, g.box_threshold, g.text_threshold)? {
+                        // a detection that overlaps a live track is that track
+                        if out.iter().any(|o| mask_bbox(&o.mask).is_some_and(|b| box_iou(&b, &det.bbox) >= 0.5)) {
+                            continue;
+                        }
+                        let mut session = Session::new(None);
+                        session.add_prompt(0, m.prompt_points(orig, &[], &[det.bbox]));
+                        let r = m.track_frame(&mut session, &e)?;
+                        let id = g.next_id;
+                        g.next_id += 1;
+                        if r.object_score > 0.0 {
+                            out.push(Entry { label: Some(det.label.clone()), score: det.score, mask: m.frame_mask(&r, orig)?, id: Some(id), present: true });
+                        }
+                        g.tracks.push(GroundedTrack { id, label: det.label, session, missing: 0 });
+                    }
+                }
+                g.tracks.retain(|tr| tr.missing <= 8);
+                out.sort_by_key(|o| o.id);
+                out
+            }
             (Model::Sam2(m), Tracking::Sam2(session)) => {
                 let e = m.embed(&img)?;
                 if first {
                     session.add_prompt(0, m.prompt_points(orig, &v.prompt.points, &v.prompt.boxes));
                 }
                 let r = m.track_frame(session, &e)?;
-                vec![Entry { score: r.object_score, mask: m.frame_mask(&r, orig)?, id: Some(0), present: r.object_score > 0.0 }]
+                vec![Entry { label: None, score: r.object_score, mask: m.frame_mask(&r, orig)?, id: Some(0), present: r.object_score > 0.0 }]
             }
             (Model::Sam3(m), Tracking::Sam3(session)) => {
                 let tf = m.encode_for_tracking(&img)?;
@@ -527,12 +686,12 @@ impl State {
                     session.add_prompt(0, p);
                 }
                 let r = m.track_frame(session, &tf)?;
-                vec![Entry { score: r.object_score, mask: m.frame_mask(&r, orig)?, id: Some(0), present: r.object_score > 0.0 }]
+                vec![Entry { label: None, score: r.object_score, mask: m.frame_mask(&r, orig)?, id: Some(0), present: r.object_score > 0.0 }]
             }
             (Model::Sam3(m), Tracking::Text(state)) => state
                 .step(m, &img)?
                 .into_iter()
-                .map(|o| Entry { score: o.detection_score.unwrap_or(o.object_score), mask: o.mask, id: Some(o.id), present: true })
+                .map(|o| Entry { label: Some(o.label), score: o.detection_score.unwrap_or(o.object_score), mask: o.mask, id: Some(o.id), present: true })
                 .collect(),
             _ => return Err(bad("the video session does not match the loaded model")),
         };
@@ -552,6 +711,7 @@ fn sync(m: &Model) -> Result<()> {
         Model::Efficient(m) => m.sync(),
         Model::Sam2(m) => m.sync(),
         Model::Sam3(m) => m.sync(),
+        Model::Dino(m) => m.sync(),
     }
 }
 
@@ -565,6 +725,7 @@ fn decode(bytes: &[u8]) -> Result<RgbImage> {
 // ------------------------------------------------------------------------------------------------ results
 
 struct Entry {
+    label: Option<String>,
     score: f32,
     mask: Mask,
     id: Option<usize>,
@@ -573,7 +734,7 @@ struct Entry {
 
 impl Entry {
     fn mask(mask: Mask, id: Option<usize>) -> Self {
-        Self { score: mask.iou, mask, id, present: true }
+        Self { label: None, score: mask.iou, mask, id, present: true }
     }
 
     fn json(&self) -> Value {
@@ -599,7 +760,7 @@ impl Entry {
             }
         }
         let bbox = if area == 0 { Value::Null } else { json!([x0, y0, x1 + 1, y1 + 1]) };
-        json!({ "id": self.id, "score": self.score, "present": self.present, "area": area, "bbox": bbox, "png": mask_png(m) })
+        json!({ "id": self.id, "label": self.label, "score": self.score, "present": self.present, "area": area, "bbox": bbox, "png": mask_png(m) })
     }
 }
 
@@ -637,6 +798,9 @@ struct SegmentRequest {
     threshold: Option<f32>,
     multimask: Option<bool>,
     tracker: Option<bool>,
+    /// A text detector (`grounding-dino-tiny` / `-base`): with `text`, the model segments inside its boxes
+    detector: Option<String>,
+    text_threshold: Option<f32>,
 }
 
 #[derive(Deserialize)]
@@ -649,6 +813,9 @@ struct VideoRequest {
     text: Option<String>,
     threshold: Option<f32>,
     detect_every: Option<usize>,
+    /// A text detector: tracks every instance of `text` with a SAM 2 model (which has no text input of its own)
+    detector: Option<String>,
+    text_threshold: Option<f32>,
 }
 
 #[derive(Deserialize)]
@@ -834,8 +1001,8 @@ async fn serve(engine: Engine, addr: String) -> std::io::Result<()> {
         let e = engine.clone();
         // images and video frames are uploaded whole
         let cfg = web::WebAppConfig::new().set_state(web::types::PayloadConfig::new(64 << 20));
-        let (e_info, e_models, e_load, e_unload, e_embed, e_seg, e_img_del, e_vid, e_frame, e_vid_del) =
-            (e.clone(), e.clone(), e.clone(), e.clone(), e.clone(), e.clone(), e.clone(), e.clone(), e.clone(), e.clone());
+        let (e_info, e_models, e_load, e_unload, e_embed, e_seg, e_img_del, e_vid, e_frame, e_vid_del, e_detect) =
+            (e.clone(), e.clone(), e.clone(), e.clone(), e.clone(), e.clone(), e.clone(), e.clone(), e.clone(), e.clone(), e.clone());
         App::new()
             .with_config(cfg)
             .service(web::resource("/health").to(async || "ok\n"))
@@ -879,6 +1046,19 @@ async fn serve(engine: Engine, addr: String) -> std::io::Result<()> {
                         .await,
                     )
                     .await
+                }
+            })))
+            .service(web::resource("/v1/detect").route(web::post().to(move |req: HttpRequest, body: Bytes| {
+                let e = e_detect.clone();
+                async move {
+                    let r = async {
+                        let model = query(&req, "model").unwrap_or_else(|| "grounding-dino-tiny".into());
+                        let Some(text) = query(&req, "text") else { return Err(bad("need ?text=a cat. a remote control.")) };
+                        let num = |k: &str, d: f32| query(&req, k).and_then(|v| v.parse().ok()).unwrap_or(d);
+                        let (bt, tt) = (num("box_threshold", 0.35), num("text_threshold", 0.25));
+                        e.call(move |s| s.detect(&model, &text, bt, tt, &body)).await
+                    };
+                    reply(r.await).await
                 }
             })))
             .service(web::resource("/v1/images").route(web::post().to(move |req: HttpRequest, body: Bytes| {

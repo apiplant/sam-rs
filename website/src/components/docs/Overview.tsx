@@ -75,6 +75,7 @@ cargo build --release --features flash-attn   # CUDA + FlashAttention-2 (long fi
             { flag: "SAM 3 \"truck\", CUDA", meaning: "osam 218 ms · sam-rs f16 + FlashAttention ~90 ms" },
             { flag: "SAM 3 \"truck\", CPU", meaning: "PyTorch 5.7 s · osam 6.9 s · sam-rs bf16 ~3.5 s" },
             { flag: "EfficientSAM-Ti", meaning: "CUDA f16 21 ms encoder + 7 ms decode · CPU bf16 ~0.3 s encoder" },
+            { flag: "Grounding DINO tiny", meaning: "CUDA f32 ~130 ms to detect (~290 ms with SAM ViT-B on top) · CPU ~3 s" },
             { flag: "MobileSAM", meaning: "CUDA f16 ~18 ms · CPU ~0.5 s" },
           ]}
         />
@@ -96,6 +97,7 @@ cargo build --release --features flash-attn   # CUDA + FlashAttention-2 (long fi
           <LI>SAM 3: every stage to about 1e-6 relative error, detection score 0.932 equal to the reference; the video tracker at binary mask IoU 1.0000 on a 6-frame clip.</LI>
           <LI>MobileSAM: encoder to 1.4e-6 against candle-transformers.</LI>
           <LI>EfficientSAM ViT-Ti: low-res masks to 1.6e-5 and IoU scores to six digits against the ONNX export on point, box and invalid-point prompts. ViT-S runs but has no reference check.</LI>
+          <LI>Grounding DINO tiny: Swin, BERT and the whole fusion encoder to about 1e-6 relative error against PyTorch, and identical detections; base loads through the same code but has no reference check.</LI>
           <LI>SAM 3 text-prompted video tracking has no reference comparison: it combines the detector and the tracker with a simple association rule.</LI>
         </UL>
       </Section>
@@ -108,6 +110,7 @@ cargo build --release --features flash-attn   # CUDA + FlashAttention-2 (long fi
             { flag: "src/sam1/", meaning: "ViT image encoder, TinyViT, prompt encoder, two-way mask decoder" },
             { flag: "src/efficientsam/", meaning: "EfficientSAM encoders, prompt encoder and decoder" },
             { flag: "src/sam2/", meaning: "Hiera encoder and the SAM 2 model, including video" },
+            { flag: "src/dino/", meaning: "Grounding DINO: Swin backbone, BERT, fusion encoder, deformable decoder; pair it with any SAM for text prompts" },
             { flag: "src/sam3/", meaning: "Vision tower, CLIP text encoder, DETR detector, mask head, tracker, video tracker, text-prompted tracking" },
             { flag: "src/kernels.rs, kernels/sam.cu", meaning: "Fused CUDA kernels and their parallel CPU versions" },
             { flag: "src/cpu_gemm.rs", meaning: "bf16 GEMM, convolution and attention kernels for AVX-512 BF16" },

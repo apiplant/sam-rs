@@ -18,6 +18,7 @@ export function DocsModels() {
             { flag: "mobile-sam", meaning: "MobileSAM: a TinyViT-5M encoder with the SAM ViT-B decoder. About 18 ms on an RTX 4090 and 0.5 s on the CPU." },
             { flag: "efficientsam-ti / -s", meaning: "EfficientSAM ViT-Tiny and ViT-Small. The upstream .pt checkpoints are downloaded and converted to safetensors once, automatically. ViT-Ti: 21 ms encoder on CUDA, 0.3 s on the CPU." },
             { flag: "sam2.1-hiera-{tiny,small,base-plus,large}", meaning: <>SAM 2.1; <IC>sam2-hiera-*</IC> are the original SAM 2 weights. Points, boxes and video tracking. 160 to 900 MB.</> },
+            { flag: "grounding-dino-tiny / -base", meaning: "Grounding DINO: phrases to boxes (a detector, not a segmenter). Pair it with any model above to prompt it with text. Tiny is 690 MB, base 940 MB." },
             { flag: "sam3", meaning: "SAM 3: text-prompted instance segmentation (score, box and mask per instance), exemplar boxes, a SAM-style tracker and video. 3.4 GB, gated on Hugging Face." },
           ]}
         />
@@ -50,11 +51,27 @@ sam-rs --model sam3 --point 500,375 --image truck.jpg      # SAM-style, one obje
       </Section>
 
       <Section>
+        <H2>Text for every SAM: Grounding DINO</H2>
+        <P>
+          Only SAM 3 understands text; the other checkpoints contain no text tensors. Grounding DINO fills the gap the way
+          Grounded-SAM does: it turns phrases (<IC>a wheel. a truck.</IC>, separated by full stops) into boxes, and the model you
+          picked segments inside each. Each result carries the words of the prompt its box matched.
+        </P>
+        <Pre caption="boxes only, then boxes to masks" lang="bash">{`sam-rs --model grounding-dino-tiny --image truck.jpg --text "a wheel. a truck." --out boxes.png
+sam-rs --model sam2.1-hiera-tiny --detector grounding-dino-tiny --image truck.jpg --text "a wheel. a truck." --out masks.png`}</Pre>
+        <P>
+          <IC>--box-threshold</IC> (0.35) is the minimum box score and <IC>--text-threshold</IC> (0.25) the minimum token score for a word
+          to label a box. Both models stay loaded, so the server needs <IC>--max-models 2</IC> or more. In the web UI pick a{" "}
+          <IC>Text detector</IC> under Prompt.
+        </P>
+      </Section>
+
+      <Section>
         <H2>Video</H2>
         <P>
           Frames are read from a directory of images sorted by name; <IC>ffmpeg -i clip.mp4 frames/%05d.png</IC>{" "}
           extracts them. A point or box on one frame follows one object forward through the clip (SAM 2 and SAM
-          3). With SAM 3 and <IC>--text</IC>, the detector finds every instance on the first frame and then every{" "}
+          3). Several concepts at once (<IC>--text "wheel. person in red"</IC>) are found separately and labelled, and SAM 2 can track by text through a Grounding DINO detector. With SAM 3 and <IC>--text</IC>, the detector finds every instance on the first frame and then every{" "}
           <IC>--detect-every</IC> frames; each detection that no live track explains starts a new tracker
           session, and a track absent for 8 frames in a row is dropped. One mask PNG per object and frame is
           written.

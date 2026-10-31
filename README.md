@@ -11,6 +11,7 @@ Rust ([candle](https://github.com/huggingface/candle)) inference for the Segment
 | **SAM 3** (`sam3`): text-prompted instance segmentation, video tracking (points, boxes or text) | working, CPU + CUDA (gated weights, see below) |
 | **MobileSAM** (`mobile-sam`) | working, CPU + CUDA |
 | **EfficientSAM** (`efficientsam-ti`, `efficientsam-s`) | working, CPU + CUDA |
+| **Grounding DINO** (`grounding-dino-tiny`, `grounding-dino-base`): text to boxes, to pair with any of the above | working, CPU + CUDA (tiny checked against PyTorch; base loads, see below) |
 
 CUDA encoder time on an RTX 4090, f16, same image: ViT-B 38 ms, ViT-L 74 ms, ViT-H 96 ms (decode adds ~7 ms). ViT-B
 checkpoints load in either the Meta layout (`lmz/candle-sam`) or the Hugging Face `transformers` layout
@@ -39,6 +40,35 @@ other models it needs no manual step. `scripts/convert_efficientsam.py` still do
 
 ViT-Ti: ~21 ms encoder + ~7 ms decode on CUDA f16; ~0.29 s encoder on CPU (the bf16 kernels where the CPU has them;
 about 1.3 s in exact f32). The prompt is always padded to exactly 6 points, as in the reference graph.
+
+## Grounding DINO: text prompts for every SAM
+
+Only SAM 3 has a text pathway; the other checkpoints contain no text tensors. Grounding DINO fills the gap the way
+Grounded-SAM does: it turns phrases into boxes, and the SAM you picked segments inside each one.
+
+```sh
+# boxes only
+sam-rs --model grounding-dino-tiny --image truck.jpg --text "a wheel. a truck." --out boxes.png
+# boxes -> masks with any SAM / MobileSAM / EfficientSAM / SAM 2 (one mask file per detection: masks_1.png, ...)
+sam-rs --model sam2.1-hiera-tiny --detector grounding-dino-tiny --image truck.jpg --text "a wheel. a truck." --out masks.png
+```
+
+Phrases are separated by full stops; `--box-threshold` (0.35) and `--text-threshold` (0.25) are the usual two. The port
+(`src/dino/`: Swin backbone, BERT text encoder, fusion encoder, language-guided query selection, cross-modality
+decoder) matches the PyTorch reference to ~1e-6 through the whole encoder and gives identical detections
+(`examples/dino_parity.rs`, reference from `scripts/ref_dino.py`). Multi-scale deformable attention, which candle has no
+`grid_sample` for, is a CPU kernel plus a CUDA kernel (`tests/dino.rs` and `tests/kernels.rs` check them against a scalar
+reference). Notes:
+
+* The reference script patches one thing: `transformers` 5.2x truncates the text position embedding to integers (a
+  `.to(pos_tensor.dtype)` regression; 5.0 and the original GroundingDINO keep floats), which makes its detections worse.
+* Image resizing is `image`'s triangle filter, not torchvision's: ~0.2% mean pixel difference and ~0.003 in scores.
+* It runs in f32 (f16 is no faster here and moves scores slightly). RTX 4090: ~130 ms to detect, ~290 ms with ViT-B
+  segmentation on top; CPU about 3 s. `grounding-dino-base` (Swin-B) loads through the same code from its
+  `config.json` but has no reference check.
+* In the server a detector and its segmenter are both loaded, so `--max-models` must be at least 2. SAM 2 can also *track* by text this
+way: `POST /v1/videos` with `{"model": "sam2.1-hiera-tiny", "text": "a wheel. a truck.", "detector": "grounding-dino-tiny"}` runs the detector on
+the first frame and every `detect_every` frames, gives each new box its own SAM 2 session and drops a track after 8 absent frames.
 
 ## SAM 2 / 2.1
 
@@ -130,6 +160,10 @@ upstream difference occasionally flips an entry by a whole bf16 step). Speed, RT
 
 #### Text-prompted detect-and-track
 
+Several concepts at once work too: `--text "wheel. person in red"` (separated by full stops, commas or semicolons) detects each
+concept on its own, labels every object with its concept and keeps the ids unique across them. The same splitting applies to
+SAM 3 image requests in the server.
+
 Give `--text` instead of a point or box and every instance of the concept is found and followed:
 
 ```sh
@@ -177,6 +211,9 @@ curl -s -X POST -d '{"text":"wheel","threshold":0.5}' localhost:8080/v1/images/$
 v=$(curl -s -X POST -d '{"model":"sam3","text":"wheel"}' localhost:8080/v1/videos | jq .id)       # video tracking session
 curl -s -X POST --data-binary @frame00.jpg localhost:8080/v1/videos/$v/frames                   # then each frame in order
 ```
+
+With a Grounding DINO model as the `detector` (`{"text": "a wheel. a truck.", "detector": "grounding-dino-tiny"}`), any non-SAM-3
+model takes text, and `POST /v1/detect?model=grounding-dino-tiny&text=...` (body: an image) returns just the boxes.
 
 `GET /openapi.json` is the full description. The UI is built with `pnpm install && pnpm build` in `ui/` (`SAM_RS_REQUIRE_UI=1`
 makes `cargo build` fail without it; release builds set it) and embedded by `build.rs`; `pnpm dev` there proxies to a

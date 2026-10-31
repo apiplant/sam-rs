@@ -94,6 +94,8 @@ export function App() {
   const [threshold, setThreshold] = createSignal<number>(saved.threshold ?? 0.5);
   const [multimask, setMultimask] = createSignal<boolean>(saved.multimask ?? true);
   const [tracker, setTracker] = createSignal(false);
+  const [detector, setDetector] = createSignal<string>(saved.detector ?? "");
+  const [boxThreshold, setBoxThreshold] = createSignal<number>(saved.boxThreshold ?? 0.35);
 
   // image mode
   const [session, setSession] = createSignal<api.ImageSession | null>(null);
@@ -116,7 +118,10 @@ export function App() {
   const spec = createMemo(() => models().find((m) => m.id === modelId()) ?? null);
   const caps = () => spec()?.capabilities;
   const isSam3 = () => spec()?.family === "SAM 3";
-  const hasPrompt = () => points().length + boxes().length + negBoxes().length > 0 || (isSam3() && text().trim().length > 0);
+  const detectors = () => models().filter((m) => m.capabilities.detector);
+  /** text goes to SAM 3 directly, or to a Grounding DINO detector in front of any other segmenter */
+  const useDetector = () => !caps()?.text && !!detector();
+  const hasPrompt = () => points().length + boxes().length + negBoxes().length > 0 || ((isSam3() || useDetector()) && text().trim().length > 0);
 
   const refresh = async () => {
     try {
@@ -135,7 +140,7 @@ export function App() {
   };
 
   createEffect(
-    () => JSON.stringify({ model: modelId(), localOnly: localOnly(), threshold: threshold(), multimask: multimask(), fps: fps(), maxFrames: maxFrames(), detectEvery: detectEvery() }),
+    () => JSON.stringify({ model: modelId(), detector: detector(), boxThreshold: boxThreshold(), localOnly: localOnly(), threshold: threshold(), multimask: multimask(), fps: fps(), maxFrames: maxFrames(), detectEvery: detectEvery() }),
     (json) => {
       try {
         localStorage.setItem(STORE, json);
@@ -243,8 +248,8 @@ export function App() {
   let segTimer: ReturnType<typeof setTimeout> | undefined;
   let segGen = 0;
   createEffect(
-    () => ({ s: session(), p: points(), b: boxes(), n: negBoxes(), t: text(), th: threshold(), mm: multimask(), tr: tracker(), mode: mode() }),
-    ({ s, p, b, n, t, th, mm, tr, mode }) => {
+    () => ({ s: session(), p: points(), b: boxes(), n: negBoxes(), t: text(), th: threshold(), mm: multimask(), tr: tracker(), mode: mode(), det: useDetector() && points().length + boxes().length + negBoxes().length === 0 && text().trim() ? detector() : "", bt: boxThreshold() }),
+    ({ s, p, b, n, t, th, mm, tr, mode, det, bt }) => {
       clearTimeout(segTimer);
       if (!s || mode !== "image") return;
       if (!hasPrompt()) {
@@ -255,7 +260,9 @@ export function App() {
         const gen = ++segGen;
         setBusy((x) => x || "Segmenting…");
         try {
-          const r = await api.segment(s.id, { points: p, boxes: b, neg_boxes: n, text: isSam3() ? t : undefined, threshold: th, multimask: mm, tracker: isSam3() ? tr : undefined });
+          const r = det
+            ? await api.segment(s.id, { text: t, detector: det, threshold: bt })
+            : await api.segment(s.id, { points: p, boxes: b, neg_boxes: n, text: isSam3() ? t : undefined, threshold: th, multimask: mm, tracker: isSam3() ? tr : undefined });
           if (gen !== segGen) return;
           setError("");
           setResp(r);
@@ -318,8 +325,9 @@ export function App() {
         model: modelId(),
         points: points(),
         boxes: boxes(),
-        text: isSam3() && noBoxPrompt ? text().trim() || undefined : undefined,
-        threshold: threshold(),
+        text: (isSam3() || useDetector()) && noBoxPrompt ? text().trim() || undefined : undefined,
+        detector: useDetector() && noBoxPrompt ? detector() : undefined,
+        threshold: useDetector() ? boxThreshold() : threshold(),
         detect_every: detectEvery(),
       });
       vid = vs.id;
@@ -358,6 +366,18 @@ export function App() {
     },
   );
 
+  // with a text detector the prompt is the text alone: drop clicks and boxes left over from another model
+  createEffect(
+    () => useDetector(),
+    (on) => {
+      if (on) {
+        setPoints([]);
+        setBoxes([]);
+        setNegBoxes([]);
+      }
+    },
+  );
+
   // ---- prompts
 
   const addPoint = (p: Point) => {
@@ -375,6 +395,11 @@ export function App() {
     setBoxes([]);
     setNegBoxes([]);
     setText("");
+    // in video mode the tracked frames lock the stage: clearing also goes back to the first frame, ready to prompt again
+    stopTrack();
+    setFrames([]);
+    setCur(0);
+    setProgress({ done: 0, total: 0 });
   };
 
   // ---- model actions
@@ -447,20 +472,21 @@ export function App() {
   const overlays = createMemo<Overlay[]>(() => {
     if (mode() === "video") {
       const f = frames()[cur()];
-      return f ? f.objects.filter((o) => o.present).map((o) => ({ png: o.png, color: colorOf(o.id ?? 0), label: o.id !== null && frames().some((x) => x.objects.length > 1) ? `#${o.id + 1}` : undefined, bbox: o.bbox })) : [];
+      return f ? f.objects.filter((o) => o.present).map((o) => ({ png: o.png, color: colorOf(o.id ?? 0), label: o.label ? `${o.label} #${(o.id ?? 0) + 1}` : o.id !== null && frames().some((x) => x.objects.length > 1) ? `#${o.id + 1}` : undefined, bbox: o.bbox })) : [];
     }
     const r = resp();
     if (!r) return [];
     return r.results
       .map((o, i) => ({ o, i }))
       .filter(({ i }) => (r.kind === "masks" ? (picked() === null ? true : picked() === i) : !hidden().includes(i)))
-      .map(({ o, i }) => ({ png: o.png, color: colorOf(i), label: r.kind === "instances" ? `${(o.score * 100).toFixed(0)}%` : undefined, bbox: r.kind === "instances" ? o.bbox : null }));
+      .map(({ o, i }) => ({ png: o.png, color: colorOf(i), label: r.kind === "instances" ? `${o.label ? o.label + " " : ""}${(o.score * 100).toFixed(0)}%` : undefined, bbox: r.kind === "instances" ? o.bbox : null }));
   });
 
   const family = (m: ModelInfo) => m.family;
   const groups = createMemo(() => {
     const out: { family: string; items: ModelInfo[] }[] = [];
     for (const m of models()) {
+      if (m.capabilities.detector) continue;
       if (localOnly() && !m.local && !m.loaded && m.id !== modelId()) continue;
       let g = out.find((x) => x.family === family(m));
       if (!g) out.push((g = { family: family(m), items: [] }));
@@ -602,24 +628,39 @@ export function App() {
                   clear
                 </button>
               </div>
-              <Show when={spec() && !caps()?.text}>
-                <div class="mb-2 rounded-lg border border-dashed border-ink-700 px-3 py-2.5 text-[12px] leading-snug text-ink-400">
-                  {spec()!.name} is prompted with clicks and boxes only. Text prompts ("wheel", "person in red") are a SAM 3 feature.
-                  <Show when={models().some((m) => m.capabilities.text)}>
-                    <button
-                      class="ml-1 cursor-pointer text-accent hover:underline"
-                      onClick={() => setModelId(models().find((m) => m.capabilities.text)!.id)}
-                    >
-                      Switch to SAM 3
-                    </button>
-                  </Show>
-                </div>
-              </Show>
               <Show when={caps()?.text}>
-                <label class="mb-1 block text-ink-300">Concept (SAM 3)</label>
-                <input class={input} placeholder="e.g. wheel, person in red" value={text()} onInput={(e) => setText(e.currentTarget.value)} />
-                <Slider label="Score threshold" value={threshold()} min={0.05} max={0.95} step={0.05} onChange={setThreshold} />
+                <label class="mb-1 block text-ink-300">Concepts (SAM 3)</label>
+                <input class={input} placeholder="e.g. wheel. person in red" value={text()} onInput={(e) => setText(e.currentTarget.value)} />
+                <p class="mt-1.5 text-[12px] leading-snug text-ink-400">Several at once, separated by full stops or commas. Each is found, labelled and, in video, tracked.</p>
+                <Slider label="Score threshold" value={threshold()} min={0.01} max={0.99} step={0.05} numeric onChange={setThreshold} />
                 <Toggle label="Tracker mode" hint="Boxes prompt one object, like SAM 2, instead of marking examples" checked={tracker()} onChange={setTracker} />
+              </Show>
+              <Show when={spec() && !caps()?.text}>
+                <label class="mb-1 block text-ink-300">Text detector</label>
+                <select
+                  class={`${input} cursor-pointer`}
+                  value={detector()}
+                  onChange={(e) => setDetector(e.currentTarget.value)}
+                >
+                  <option value="">None: clicks and boxes only</option>
+                  <For each={detectors()}>
+                    {(d) => (
+                      <option value={d.id}>
+                        {d.name}
+                        {d.local ? "" : " (downloads)"}
+                      </option>
+                    )}
+                  </For>
+                </select>
+                <Show
+                  when={useDetector()}
+                  fallback={<p class="mt-1.5 text-[12px] leading-snug text-ink-400">{spec()!.name} has no text input of its own. Pick Grounding DINO to type phrases: it finds the boxes and {spec()!.name} cuts each one out.</p>}
+                >
+                  <label class="mb-1 mt-3 block text-ink-300">Phrases</label>
+                  <input class={input} placeholder="a wheel. a truck." value={text()} onInput={(e) => setText(e.currentTarget.value)} />
+                  <p class="mt-1.5 text-[12px] leading-snug text-ink-400">Separate phrases with full stops. The image takes text only while a detector is selected (clicks and boxes are off). Grounding DINO and {spec()!.name} both stay loaded.</p>
+                  <Slider label="Box threshold" value={boxThreshold()} min={0.01} max={0.99} step={0.05} numeric onChange={setBoxThreshold} />
+                </Show>
               </Show>
               <Toggle label="Three candidates" hint="Ambiguous clicks return several masks to pick from" checked={multimask()} onChange={setMultimask} />
               <ul class="mt-2 space-y-1.5 text-[12px] leading-snug text-ink-400">
@@ -653,7 +694,7 @@ export function App() {
               boxes={mode() === "video" && frames().length ? [] : boxes()}
               negBoxes={mode() === "video" && frames().length ? [] : negBoxes()}
               busy={busy() || (tracking() ? `Tracking ${progress().done}/${progress().total}…` : "")}
-              interactive={!tracking() && !(mode() === "video" && frames().length > 0)}
+              interactive={!tracking() && !useDetector() && !(mode() === "video" && frames().length > 0)}
               onPoint={addPoint}
               onBox={addBox}
               onFile={openFiles}
@@ -719,7 +760,7 @@ export function App() {
                   setDetectEvery={setDetectEvery}
                   count={frameCount()}
                   hasPrompt={hasPrompt()}
-                  isSam3={isSam3()}
+                  isSam3={isSam3() || useDetector()}
                   tracking={tracking()}
                   progress={progress()}
                   frames={frames()}
@@ -785,7 +826,7 @@ function ImageResults(props: {
                   <span class="size-3 flex-none rounded-[4px]" style={{ background: colorOf(idx()), opacity: on() ? 1 : 0.3 }} />
                   <span class="min-w-0 flex-1">
                     <span class="flex items-baseline justify-between gap-2">
-                      <span class="text-ink-100">{r().kind === "instances" ? `Instance ${idx() + 1}` : `Mask ${idx() + 1}`}</span>
+                      <span class="truncate text-ink-100">{o.label || (r().kind === "instances" ? `Instance ${idx() + 1}` : `Mask ${idx() + 1}`)}</span>
                       <span class="font-mono text-[12px] text-ink-200">{(o.score * 100).toFixed(1)}%</span>
                     </span>
                     <span class="mt-1.5 block h-1 overflow-hidden rounded-full bg-ink-700">
@@ -892,7 +933,7 @@ function VideoPanel(props: {
                 {(o) => (
                   <div class="flex items-center gap-2.5 rounded-lg border border-ink-750 bg-ink-850 px-2.5 py-2">
                     <span class="size-3 flex-none rounded-[4px]" style={{ background: colorOf(o.id ?? 0), opacity: o.present ? 1 : 0.3 }} />
-                    <span class="flex-1 text-ink-100">Object {(o.id ?? 0) + 1}</span>
+                    <span class="min-w-0 flex-1 truncate text-ink-100">{o.label ? `${o.label} #${(o.id ?? 0) + 1}` : `Object ${(o.id ?? 0) + 1}`}</span>
                     <span class={`font-mono text-[11.5px] ${o.present ? "text-ink-200" : "text-warn"}`}>{o.present ? `${o.area.toLocaleString()} px` : "absent"}</span>
                     <a
                       class="grid size-6 place-items-center rounded-md text-ink-400 hover:bg-ink-700 hover:text-ink-100"

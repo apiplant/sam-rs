@@ -24,11 +24,14 @@ pub struct TrackedObject {
     pub object_score: f32,
     /// Detector score when the object was detected on this frame.
     pub detection_score: Option<f32>,
+    /// The concept ("wheel") this object was found for.
+    pub label: String,
     pub mask: Mask,
 }
 
 struct Track {
     id: usize,
+    label: String,
     session: Session,
     missing: usize,
 }
@@ -36,7 +39,8 @@ struct Track {
 /// The tracker's state without a borrow of the model, so it can live next to the model in a server.
 /// [`TextTracker`] is the convenient wrapper.
 pub struct TextState {
-    prompt: String,
+    /// the concepts to find, e.g. `["wheel", "person in red"]`
+    concepts: Vec<String>,
     threshold: f32,
     detect_every: usize,
     max_missing: usize,
@@ -45,6 +49,11 @@ pub struct TextState {
     tracks: Vec<Track>,
     next_id: usize,
     frame: usize,
+}
+
+/// Splits a prompt into concepts at full stops, commas, semicolons and new lines.
+pub fn concepts(prompt: &str) -> Vec<String> {
+    prompt.split(['.', ',', ';', '\n']).map(str::trim).filter(|c| !c.is_empty()).map(str::to_string).collect()
 }
 
 fn mask_iou(a: &Mask, b: &Mask) -> f32 {
@@ -60,8 +69,9 @@ fn mask_iou(a: &Mask, b: &Mask) -> f32 {
 }
 
 impl TextState {
+    /// `prompt`: one concept, or several separated by full stops, commas, semicolons or new lines ("wheel. person in red").
     pub fn new(prompt: &str, threshold: f32) -> Self {
-        Self { prompt: prompt.to_string(), threshold, detect_every: 5, max_missing: 8, match_iou: 0.5, tracks: vec![], next_id: 0, frame: 0 }
+        Self { concepts: concepts(prompt), threshold, detect_every: 5, max_missing: 8, match_iou: 0.5, tracks: vec![], next_id: 0, frame: 0 }
     }
 
     /// Re-run the detector every `n` frames (1 = every frame; the first frame is always detected).
@@ -86,7 +96,12 @@ impl TextState {
         let orig = (img.height() as usize, img.width() as usize);
         let (tf, detections) = if detect {
             let f = sam.encode_image(img)?;
-            let det = sam.segment(&f, &self.prompt, self.threshold)?;
+            // every concept is detected on its own; the strongest detections claim an object first
+            let mut det: Vec<(String, Instance)> = vec![];
+            for c in &self.concepts {
+                det.extend(sam.segment(&f, c, self.threshold)?.into_iter().map(|i| (c.clone(), i)));
+            }
+            det.sort_by(|a, b| b.1.score.total_cmp(&a.1.score));
             (sam.tracker_features(&f)?, det)
         } else {
             (sam.encode_for_tracking(img)?, vec![])
@@ -99,7 +114,7 @@ impl TextState {
             if r.object_score > 0.0 {
                 let mask = sam.frame_mask(&r, orig)?;
                 t.missing = 0;
-                out.push(TrackedObject { id: t.id, object_score: r.object_score, detection_score: None, mask });
+                out.push(TrackedObject { id: t.id, object_score: r.object_score, detection_score: None, label: t.label.clone(), mask });
             } else {
                 t.missing += 1;
             }
@@ -107,7 +122,7 @@ impl TextState {
 
         // new detections that no live track explains start new tracks
         let (sx, sy) = (super::SIZE as f32 / orig.1 as f32, super::SIZE as f32 / orig.0 as f32);
-        for Instance { score, bbox, mask } in detections {
+        for (label, Instance { score, bbox, mask }) in detections {
             if let Some(o) = out.iter_mut().find(|o| mask_iou(&o.mask, &mask) >= self.match_iou) {
                 o.detection_score = Some(score);
                 continue;
@@ -120,8 +135,8 @@ impl TextState {
             let (m, os) = if r.object_score > 0.0 { (tracked, r.object_score) } else { (mask, r.object_score) };
             let id = self.next_id;
             self.next_id += 1;
-            self.tracks.push(Track { id, session, missing: 0 });
-            out.push(TrackedObject { id, object_score: os, detection_score: Some(score), mask: m });
+            self.tracks.push(Track { id, label: label.clone(), session, missing: 0 });
+            out.push(TrackedObject { id, object_score: os, detection_score: Some(score), label, mask: m });
         }
 
         let limit = self.max_missing;
@@ -169,6 +184,13 @@ mod tests {
 
     fn m(data: Vec<u8>) -> Mask {
         Mask { width: data.len(), height: 1, data, iou: 1.0 }
+    }
+
+    #[test]
+    fn splits_concepts() {
+        assert_eq!(concepts("wheel. person in red, dog;\ncat"), vec!["wheel", "person in red", "dog", "cat"]);
+        assert_eq!(concepts("  truck  "), vec!["truck"]);
+        assert!(concepts(" . , ").is_empty());
     }
 
     #[test]
