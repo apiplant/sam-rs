@@ -22,15 +22,40 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # A release build is LTO + one codegen unit; the extra debug info earlier
-  # stages emit is stripped anyway.
+  # `sam-rs serve` embeds the web UI; a build without it must fail rather than ship a server with an empty page.
+  SAM_RS_REQUIRE_UI: "1"
+  # The release profile strips symbols (Cargo.toml), so debug info is not worth emitting.
   CARGO_INCREMENTAL: 0
   # workflow_dispatch has no tag ref: fall back to the tag input, or v0.0.0.
   TAG: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag || 'v0.0.0' }}
 
 jobs:
+  # The web UI (ui/) is built once; every binary job embeds the same files.
+  ui:
+    name: web UI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build
+        working-directory: ui
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ui-dist
+          path: ui/dist
+          if-no-files-found: error
+
   binaries:
     name: ${{ matrix.target }}
+    needs: ui
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -50,6 +75,10 @@ jobs:
             bins: "sam-rs"
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ui-dist
+          path: ui/dist
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -99,6 +128,7 @@ jobs:
   # container image provides those without needing a GPU runner.
   cuda-binary:
     name: x86_64-unknown-linux-gnu (cuda)
+    needs: ui
     runs-on: ubuntu-22.04
     container: nvidia/cuda:12.1.1-devel-ubuntu22.04
     steps:
@@ -108,6 +138,10 @@ jobs:
           apt-get install -y --no-install-recommends curl build-essential pkg-config ca-certificates git
 
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ui-dist
+          path: ui/dist
 
       - name: Install Rust
         run: |
@@ -152,6 +186,7 @@ jobs:
   # in step (a later Arch CUDA major needs a rebuilt release).
   cuda-binary-arch:
     name: x86_64-unknown-linux-gnu (cuda, arch)
+    needs: ui
     runs-on: ubuntu-latest
     # Rolling Arch can break a CUDA build before anything in this repository changes; the Arch CUDA
     # package then falls back to the generic CUDA archive instead of blocking the release.
@@ -162,6 +197,10 @@ jobs:
         run: pacman -Sy --noconfirm --needed rust cuda git 
 
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ui-dist
+          path: ui/dist
 
       - name: Build
         shell: bash

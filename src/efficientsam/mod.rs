@@ -8,6 +8,8 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::{conv2d, conv2d_no_bias, linear, Conv2d, Conv2dConfig, LayerNorm, Linear, Module, VarBuilder};
 use image::RgbImage;
 
+use crate::cpu_gemm::Linear as FastLinear;
+use crate::kernels::{bias_gelu, bias_residual};
 use crate::sam1::encoder::LayerNorm2d;
 use crate::sam2::hiera::bicubic;
 use crate::sam3::nn::{ln, sdpa};
@@ -40,7 +42,8 @@ impl Variant {
         }
     }
 
-    fn file(self) -> &'static str {
+    /// Checkpoint name without extension (`efficient_sam_vitt`).
+    pub fn file(self) -> &'static str {
         match self {
             Self::Tiny => "efficient_sam_vitt",
             Self::Small => "efficient_sam_vits",
@@ -50,26 +53,51 @@ impl Variant {
 
 struct Block {
     n1: LayerNorm,
-    qkv: Linear,
-    proj: Linear,
+    qkv_w: FastLinear,
+    qkv_b: Tensor,
+    proj_w: FastLinear,
+    proj_b: Tensor,
     n2: LayerNorm,
-    fc1: Linear,
-    fc2: Linear,
+    fc1_w: FastLinear,
+    fc1_b: Tensor,
+    fc2_w: FastLinear,
+    fc2_b: Tensor,
     heads: usize,
 }
 
+/// `[out, in]` checkpoint weight and bias -> (`x @ w` layer, bias).
+fn fast_linear(vb: VarBuilder, inp: usize, out: usize) -> candle_core::Result<(FastLinear, Tensor)> {
+    Ok((FastLinear::new(vb.get((out, inp), "weight")?.t()?.contiguous()?)?, vb.get(out, "bias")?))
+}
+
 impl Block {
+    fn new(dim: usize, heads: usize, l: VarBuilder) -> candle_core::Result<Self> {
+        let (qkv_w, qkv_b) = fast_linear(l.pp("attn.qkv"), dim, dim * 3)?;
+        let (proj_w, proj_b) = fast_linear(l.pp("attn.proj"), dim, dim)?;
+        let (fc1_w, fc1_b) = fast_linear(l.pp("mlp.fc1"), dim, dim * 4)?;
+        let (fc2_w, fc2_b) = fast_linear(l.pp("mlp.fc2"), dim * 4, dim)?;
+        Ok(Self { n1: ln(dim, 1e-6, l.pp("norm1"))?, qkv_w, qkv_b, proj_w, proj_b, n2: ln(dim, 1e-6, l.pp("norm2"))?, fc1_w, fc1_b, fc2_w, fc2_b, heads })
+    }
+
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let (b, h, w, c) = x.dims4()?;
         let n = h * w;
         let hd = c / self.heads;
-        let y = self.n1.forward(x)?.reshape((b, n, c))?;
-        let qkv = self.qkv.forward(&y)?.reshape((b, n, 3, self.heads, hd))?;
-        let part = |i: usize| qkv.narrow(2, i, 1)?.squeeze(2)?.transpose(1, 2)?.contiguous();
-        let o = sdpa(&part(0)?, &part(1)?, &part(2)?, None)?.transpose(1, 2)?.reshape((b, h, w, c))?;
-        let x = (x + self.proj.forward(&o)?)?;
-        let m = self.fc2.forward(&self.fc1.forward(&self.n2.forward(&x)?)?.gelu_erf()?)?;
-        x + m
+        let y = self.n1.forward(x)?.reshape((n, c))?;
+        let qkv = self.qkv_w.forward(&y)?.broadcast_add(&self.qkv_b)?.reshape((b, n, 3, self.heads, hd))?;
+        let part = |i: usize| qkv.narrow(2, i, 1)?.squeeze(2)?.contiguous(); // [b, n, heads, hd]
+        let (q, k, v) = (part(0)?, part(1)?, part(2)?);
+        let o = match crate::kernels::flash_attn_cpu(&q, &k, &v)? {
+            Some(o) => o,
+            None => {
+                let t = |t: &Tensor| t.transpose(1, 2);
+                sdpa(&t(&q)?, &t(&k)?, &t(&v)?, None)?.transpose(1, 2)?
+            }
+        };
+        let o = self.proj_w.forward(&o.reshape((n, c))?)?;
+        let x = bias_residual(&x.reshape((n, c))?, &o, &self.proj_b)?;
+        let m = bias_gelu(&self.fc1_w.forward(&self.n2.forward(&x)?)?, &self.fc1_b)?;
+        bias_residual(&x, &self.fc2_w.forward(&m)?, &self.fc2_b)?.reshape((b, h, w, c))
     }
 }
 
@@ -91,20 +119,7 @@ impl Encoder {
         let pe = vb.get((1, 197, dim), "pos_embed")?.to_dtype(DType::F32)?.narrow(1, 1, 196)?.reshape((14, 14, dim))?.permute((2, 0, 1))?.contiguous()?;
         let pos = bicubic(&pe.flatten_all()?.to_vec1::<f32>()?, dim, 14, 14, SIDE, SIDE);
         let pos = Tensor::from_vec(pos, (1, dim, SIDE, SIDE), device)?.permute((0, 2, 3, 1))?.contiguous()?.to_dtype(vb.dtype())?;
-        let blocks = (0..depth)
-            .map(|i| {
-                let l = vb.pp(format!("blocks.{i}"));
-                Ok(Block {
-                    n1: ln(dim, 1e-6, l.pp("norm1"))?,
-                    qkv: linear(dim, dim * 3, l.pp("attn.qkv"))?,
-                    proj: linear(dim, dim, l.pp("attn.proj"))?,
-                    n2: ln(dim, 1e-6, l.pp("norm2"))?,
-                    fc1: linear(dim, dim * 4, l.pp("mlp.fc1"))?,
-                    fc2: linear(dim * 4, dim, l.pp("mlp.fc2"))?,
-                    heads,
-                })
-            })
-            .collect::<candle_core::Result<_>>()?;
+        let blocks = (0..depth).map(|i| Block::new(dim, heads, vb.pp(format!("blocks.{i}")))).collect::<candle_core::Result<_>>()?;
         Ok(Self {
             patch,
             pos,
@@ -232,9 +247,23 @@ impl Embedding {
     }
 }
 
+/// Opens a `.safetensors` file, or an upstream PyTorch `.pt`/`.pth` checkpoint (tensors only, nothing is executed).
+fn load_vb(path: &std::path::Path, device: &Device, dtype: DType) -> candle_core::Result<VarBuilder<'static>> {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("pt" | "pth" | "bin") => {
+            // some releases nest the weights under a "model" key
+            match VarBuilder::from_pth(path, dtype, device) {
+                Ok(vb) if vb.contains_tensor("image_encoder.patch_embed.proj.weight") => Ok(vb),
+                _ => VarBuilder::from_pth_with_state(path, dtype, "model", device),
+            }
+        }
+        _ => unsafe { VarBuilder::from_mmaped_safetensors(&[path], dtype, device) },
+    }
+}
+
 impl EfficientSam {
     pub fn from_file(v: Variant, weights: &std::path::Path, device: &Device, dtype: DType) -> Result<Self> {
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights], dtype, device)? };
+        let vb = load_vb(weights, device, dtype)?;
         let pe = vb.pp("prompt_encoder");
         let md = vb.pp("mask_decoder");
         let t = md.pp("transformer");
@@ -283,7 +312,7 @@ impl EfficientSam {
         Ok(me)
     }
 
-    /// Downloads the checkpoint on first use and converts it to safetensors next to it.
+    /// Downloads the upstream `.pt` checkpoint on first use (a converted `.safetensors` in the cache is preferred).
     pub fn from_pretrained(v: Variant, device: &Device, dtype: DType) -> Result<Self> {
         let path = crate::download::fetch_efficientsam(v.file())?;
         Self::from_file(v, &path, device, dtype)
@@ -386,16 +415,16 @@ impl EfficientSam {
         let iou_tok = queries.narrow(1, 0, 1)?.squeeze(1)?;
         let mask_toks = queries.narrow(1, 1, 4)?;
         let src = keys.transpose(1, 2)?.reshape((1, D, SIDE, SIDE))?;
-        // InstanceNorm: statistics per channel over the spatial map, then a per-channel scale and shift
-        let u = d.up1.forward(&src, false)?.to_dtype(DType::F32)?;
-        let (c0, hw) = (u.dim(1)?, u.dim(2)? * u.dim(3)?);
-        let u = u.reshape((1, c0, hw))?;
-        let mean = u.mean_keepdim(2)?;
+        // one-group GroupNorm: statistics over all channels and positions together, then a per-channel scale / shift
+        let u0 = d.up1.forward(&src, false)?;
+        let (c0, h0, w0) = (u0.dim(1)?, u0.dim(2)?, u0.dim(3)?);
+        let u = u0.to_dtype(DType::F32)?.reshape((1, c0 * h0 * w0))?;
+        let mean = u.mean_keepdim(1)?;
         let xc = u.broadcast_sub(&mean)?;
-        let var = xc.sqr()?.mean_keepdim(2)?;
-        let un = xc.broadcast_div(&(var + 1e-5)?.sqrt()?)?;
-        let un = un.broadcast_mul(&d.up_ln.0.to_dtype(DType::F32)?.reshape((1, c0, 1))?)?.broadcast_add(&d.up_ln.1.to_dtype(DType::F32)?.reshape((1, c0, 1))?)?;
-        let up = un.reshape((1, c0, d.up1.forward(&src, false)?.dim(2)?, ()))?.to_dtype(dt)?.gelu_erf()?;
+        let var = xc.sqr()?.mean_keepdim(1)?;
+        let un = xc.broadcast_div(&(var + 1e-5)?.sqrt()?)?.reshape((1, c0, h0, w0))?;
+        let un = un.broadcast_mul(&d.up_ln.0.to_dtype(DType::F32)?.reshape((1, c0, 1, 1))?)?.broadcast_add(&d.up_ln.1.to_dtype(DType::F32)?.reshape((1, c0, 1, 1))?)?;
+        let up = un.to_dtype(dt)?.gelu_erf()?;
         let up = d.up2.forward(&up, false)?.gelu_erf()?;
         let (c, h, w) = (up.dim(1)?, up.dim(2)?, up.dim(3)?);
         let hyper = Tensor::stack(&(0..4).map(|i| d.hyper[i].forward(&mask_toks.narrow(1, i, 1)?.squeeze(1)?)).collect::<candle_core::Result<Vec<_>>>()?, 1)?;

@@ -6,7 +6,8 @@ import { Home } from "./components/Home";
 import { DocsOverview } from "./components/docs/Overview";
 import { DocsLibrary } from "./components/docs/Library";
 import { DocsCli } from "./components/docs/Cli";
-import { DocsTasks } from "./components/docs/Tasks";
+import { DocsServe } from "./components/docs/Serve";
+import { DocsModels } from "./components/docs/Tasks";
 import { LinkButton } from "./components/ui";
 
 function Shell(props: ParentProps) {
@@ -42,7 +43,8 @@ const Router = createRouter({
     { path: "/docs", component: DocsOverview },
     { path: "/docs/library", component: DocsLibrary },
     { path: "/docs/cli", component: DocsCli },
-    { path: "/docs/tasks", component: DocsTasks },
+    { path: "/docs/models", component: DocsModels },
+    { path: "/docs/serve", component: DocsServe },
     { path: "*404", component: NotFound },
   ],
 });

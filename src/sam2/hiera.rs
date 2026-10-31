@@ -114,7 +114,7 @@ struct Block {
 /// Max pool (kernel = stride = `s`) over the spatial dims of an NHWC tensor (even sizes).
 fn pool(x: &Tensor, s: usize) -> Result<Tensor> {
     // candle's native pooling kernel is far faster than two strided `max` reductions
-    x.permute((0, 3, 1, 2))?.contiguous()?.max_pool2d(s)?.permute((0, 2, 3, 1))?.contiguous()
+    crate::kernels::maxpool_nhwc(x, s)
 }
 
 fn partition(x: &Tensor, ws: usize) -> Result<(Tensor, (usize, usize))> {
@@ -168,10 +168,9 @@ impl Block {
         let (nw, hh, ww, dim) = y.dims4()?;
         let n = hh * ww;
         let hd = self.dim_out / self.heads;
-        let qkv = self.qkv_w.forward(&y.reshape((nw * n, dim))?)?.broadcast_add(&self.qkv_b.to_dtype(y.dtype())?)?.reshape((nw, n, 3, self.heads, hd))?;
-        let q = qkv.narrow(2, 0, 1)?.squeeze(2)?.contiguous()?;
-        let k = qkv.narrow(2, 1, 1)?.squeeze(2)?.contiguous()?;
-        let v = qkv.narrow(2, 2, 1)?.squeeze(2)?.contiguous()?;
+        let qkv = crate::kernels::bias_split3(&self.qkv_w.forward(&y.reshape((nw * n, dim))?)?, &self.qkv_b.to_dtype(y.dtype())?)?;
+        let part = |i: usize| qkv.narrow(0, i, 1)?.reshape((nw, n, self.heads, hd));
+        let (q, k, v) = (part(0)?, part(1)?, part(2)?);
         let (q, qh, qw) = match self.stride {
             Some(s) => {
                 let qp = pool(&q.reshape((nw, hh, ww, self.heads * hd))?, s)?;
@@ -270,7 +269,7 @@ impl Hiera {
 
     /// `[1, 3, S, S]` -> the three neck levels, highest resolution first (`[1, 256, S/4, S/4]`, `/8`, `/16`).
     pub fn forward(&self, img: &Tensor) -> Result<Vec<Tensor>> {
-        let mut x = self.patch.forward(img)?.permute((0, 2, 3, 1))?.broadcast_add(&self.pos.to_dtype(img.dtype())?)?;
+        let mut x = crate::kernels::nchw_to_nhwc_add(&self.patch.forward(img)?, &self.pos.to_dtype(img.dtype())?)?;
         let mut stages = vec![];
         for (i, b) in self.blocks.iter().enumerate() {
             x = b.forward(&x)?;
@@ -282,7 +281,7 @@ impl Hiera {
         let mut outs: Vec<Tensor> = vec![];
         let mut prev: Option<Tensor> = None;
         for i in (0..=n).rev() {
-            let lateral = self.convs[n - i].forward(&stages[i].permute((0, 3, 1, 2))?.contiguous()?)?;
+            let lateral = self.convs[n - i].forward(&crate::kernels::nhwc_to_nchw(&stages[i])?)?;
             let cur = match (&prev, self.top_down.contains(&i) && i != n) {
                 (Some(p), true) => {
                     let (h, w) = (lateral.dim(2)?, lateral.dim(3)?);

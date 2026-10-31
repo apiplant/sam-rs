@@ -8,10 +8,10 @@ use sam_rs::{Prompt, Sam, SamVariant};
 #[derive(Parser)]
 #[command(version, about = "Segment Anything inference in Rust (candle), CPU and CUDA")]
 struct Args {
-    /// Input image
-    #[arg(long)]
+    /// Input image (not needed with --video)
+    #[arg(long, required_unless_present = "video", default_value = "")]
     image: String,
-    /// Model: sam-vit-b | sam-vit-l | sam-vit-h | mobile-sam | sam2.1-hiera-{tiny,small,base-plus,large} | sam2-hiera-* | sam3
+    /// Model: sam-vit-b | sam-vit-l | sam-vit-h | mobile-sam | efficientsam-ti | efficientsam-s | sam2.1-hiera-{tiny,small,base-plus,large} | sam2-hiera-* | sam3
     #[arg(long, default_value = "sam-vit-b")]
     model: String,
     /// Use this checkpoint file instead of the cached / downloaded one (Meta layout, .safetensors)
@@ -38,6 +38,9 @@ struct Args {
     /// SAM 3 --video: index of the frame the prompt belongs to (tracking runs forward from there)
     #[arg(long, default_value_t = 0)]
     prompt_frame: usize,
+    /// SAM 3 --video --text: run the detector every N frames to find objects that appear later
+    #[arg(long, default_value_t = 5)]
+    detect_every: usize,
     /// SAM 3: treat --point / --box as SAM-style prompts for one object (the tracker) instead of text/exemplars
     #[arg(long)]
     tracker: bool,
@@ -68,11 +71,50 @@ fn nums(s: &str) -> Result<Vec<f32>> {
     s.split(',').map(|v| v.trim().parse::<f32>().with_context(|| format!("bad number {v:?}"))).collect()
 }
 
+/// `sam-rs serve`: the HTTP API and web UI.
+#[cfg(feature = "serve")]
+#[derive(Parser)]
+#[command(name = "sam-rs serve", about = "Serve every model over an HTTP API, with a web UI at /")]
+struct ServeArgs {
+    /// Address to listen on
+    #[arg(long, default_value = "127.0.0.1:8080")]
+    addr: String,
+    /// Force CPU
+    #[arg(long)]
+    cpu: bool,
+    /// CPU: exact f32 instead of the bf16 kernels
+    #[arg(long)]
+    f32: bool,
+    /// Compute dtype on CUDA: f16 (default) or f32
+    #[arg(long, default_value = "f16")]
+    dtype: String,
+    /// How many models stay loaded at once; the least recently used is dropped first
+    #[arg(long, default_value_t = 2)]
+    max_models: usize,
+    /// Load this model before listening (repeatable)
+    #[arg(long = "preload")]
+    preload: Vec<String>,
+    /// Never download checkpoints: only models already in the cache can be loaded
+    #[arg(long)]
+    no_download: bool,
+}
+
 fn main() -> Result<()> {
     sam_rs::cpu_gemm::init_threads();
+    #[cfg(feature = "serve")]
+    if std::env::args().nth(1).as_deref() == Some("serve") {
+        let a = ServeArgs::parse_from(std::env::args().skip(1));
+        if a.f32 {
+            sam_rs::cpu_gemm::set_enabled(false);
+        }
+        return sam_rs::serve::run(sam_rs::serve::Options { addr: a.addr, cpu: a.cpu, dtype: a.dtype, max_models: a.max_models, allow_download: !a.no_download, preload: a.preload });
+    }
     let a = Args::parse();
     if a.f32 {
         sam_rs::cpu_gemm::set_enabled(false);
+    }
+    if let Some(v) = sam_rs::efficientsam::Variant::parse(&a.model) {
+        return run_efficientsam(&a, v);
     }
     if let Some(v) = sam_rs::sam2::Sam2Variant::parse(&a.model) {
         return run_sam2(&a, v);
@@ -284,6 +326,9 @@ fn run_sam3_video(a: &Args) -> Result<()> {
     if a.prompt_frame >= files.len() {
         bail!("--prompt-frame {} but only {} frames in {dir}", a.prompt_frame, files.len());
     }
+    if let Some(text) = a.text.as_deref().filter(|_| a.points.is_empty() && a.boxes.is_empty()) {
+        return run_sam3_text_video(a, text, &files);
+    }
     let mut prompt = FramePrompt::default();
     let first = image::open(&files[a.prompt_frame])?.to_rgb8();
     let (sx, sy) = (1008.0 / first.width() as f32, 1008.0 / first.height() as f32);
@@ -460,6 +505,99 @@ fn run_sam2_video(a: &Args, variant: sam_rs::sam2::Sam2Variant) -> Result<()> {
             let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| format!("{i}"));
             let buf: Vec<u8> = mask.data.iter().map(|&v| v * 255).collect();
             image::GrayImage::from_raw(mask.width as u32, mask.height as u32, buf).context("mask buffer")?.save(std::path::Path::new(out).join(format!("{name}_mask.png")))?;
+        }
+    }
+    eprintln!("{} frames in {:.2?}", files.len() - a.prompt_frame, t_all.elapsed());
+    Ok(())
+}
+
+/// EfficientSAM: point and box prompts, three candidate masks.
+fn run_efficientsam(a: &Args, variant: sam_rs::efficientsam::Variant) -> Result<()> {
+    use sam_rs::efficientsam::EfficientSam;
+    let device = if a.cpu { Device::Cpu } else { Device::cuda_if_available(0)? };
+    let dtype = match (device.is_cuda(), a.dtype.as_str()) {
+        (true, "f16") => DType::F16,
+        _ => DType::F32,
+    };
+    let sam = EfficientSam::from_pretrained(variant, &device, dtype)?;
+    let img = image::open(&a.image).with_context(|| format!("opening {}", a.image))?.to_rgb8();
+    let mut points = vec![];
+    for s in &a.points {
+        let v = nums(s)?;
+        if v.len() < 2 {
+            bail!("--point needs x,y[,label]");
+        }
+        points.push((v[0], v[1], v.get(2).map_or(true, |l| *l != 0.0)));
+    }
+    let mut boxes = vec![];
+    for s in &a.boxes {
+        let v = nums(s)?;
+        if v.len() != 4 {
+            bail!("--box needs x0,y0,x1,y1");
+        }
+        boxes.push([v[0], v[1], v[2], v[3]]);
+    }
+    if points.is_empty() && boxes.is_empty() {
+        points.push((img.width() as f32 / 2.0, img.height() as f32 / 2.0, true));
+    }
+    let t = Instant::now();
+    let emb = sam.embed(&img)?;
+    let masks = sam.predict(&emb, &points, &boxes)?;
+    eprintln!("embed + decode: {:.2?}", t.elapsed());
+    if let Some(n) = a.bench {
+        let (mut te, mut td) = (0.0, 0.0);
+        for _ in 0..n {
+            let t = Instant::now();
+            let e = sam.embed(&img)?;
+            sam.sync()?;
+            te += t.elapsed().as_secs_f64();
+            let t = Instant::now();
+            sam.predict(&e, &points, &boxes)?;
+            td += t.elapsed().as_secs_f64();
+        }
+        eprintln!("bench x{n}: encoder {:.1} ms, decoder {:.1} ms", te / n as f64 * 1e3, td / n as f64 * 1e3);
+    }
+    for (i, m) in masks.iter().enumerate() {
+        println!("mask {i}: iou {:.3}, area {}", m.iou, m.data.iter().filter(|&&v| v > 0).count());
+    }
+    let best = match a.index {
+        Some(i) => masks.get(i).with_context(|| format!("--index {i}: only {} masks", masks.len()))?,
+        None => masks.iter().max_by(|x, y| x.iou.total_cmp(&y.iou)).context("no masks")?,
+    };
+    if let Some(out) = &a.out {
+        let buf: Vec<u8> = best.data.iter().map(|&v| v * 255).collect();
+        image::GrayImage::from_raw(best.width as u32, best.height as u32, buf).context("mask buffer")?.save(out)?;
+    }
+    Ok(())
+}
+
+/// SAM 3 text-prompted detect-and-track: every instance of `--text` is found, then followed through the frames.
+/// Writes `NAME_obj<ID>_mask.png` per object and frame into `--out DIR`.
+fn run_sam3_text_video(a: &Args, text: &str, files: &[std::path::PathBuf]) -> Result<()> {
+    use sam_rs::sam3::{text_track::TextTracker, Sam3};
+    let device = if a.cpu { Device::Cpu } else { Device::cuda_if_available(0)? };
+    let dtype = match (device.is_cuda(), a.dtype.as_str()) {
+        (true, "f16") => DType::F16,
+        _ => DType::F32,
+    };
+    let sam = Sam3::from_pretrained(&device, dtype)?;
+    let mut tracker = TextTracker::new(&sam, text, a.threshold).detect_every(a.detect_every);
+    if let Some(out) = &a.out {
+        std::fs::create_dir_all(out)?;
+    }
+    let t_all = Instant::now();
+    for (i, path) in files.iter().enumerate().skip(a.prompt_frame) {
+        let t = Instant::now();
+        let img = image::open(path).with_context(|| format!("opening {}", path.display()))?.to_rgb8();
+        let objects = tracker.step(&img)?;
+        let summary: Vec<String> = objects.iter().map(|o| format!("#{} area {}{}", o.id, o.mask.data.iter().filter(|&&v| v > 0).count(), if o.detection_score.is_some() { " (detected)" } else { "" })).collect();
+        println!("frame {i}: {} object(s) [{}]  [{:.0?}]", objects.len(), summary.join(", "), t.elapsed());
+        if let Some(out) = &a.out {
+            let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| format!("{i}"));
+            for o in &objects {
+                let buf: Vec<u8> = o.mask.data.iter().map(|&v| v * 255).collect();
+                image::GrayImage::from_raw(o.mask.width as u32, o.mask.height as u32, buf).context("mask buffer")?.save(std::path::Path::new(out).join(format!("{name}_obj{}_mask.png", o.id)))?;
+            }
         }
     }
     eprintln!("{} frames in {:.2?}", files.len() - a.prompt_frame, t_all.elapsed());

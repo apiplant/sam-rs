@@ -1,0 +1,86 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "sam-rs serve",
+    "version": "VERSION",
+    "description": "Segment Anything (SAM, MobileSAM, EfficientSAM, SAM 2, SAM 3) over HTTP. The models live on one worker thread: requests queue and run one at a time. Models load on first use (downloading the checkpoint unless the server was started with `--no-download`) and the least recently used is dropped past `--max-models`.\n\nCoordinates are pixels of the image you uploaded. Masks come back as base64 8-bit grayscale PNGs (255 inside) at the image size.",
+    "license": { "name": "Apache-2.0" }
+  },
+  "paths": {
+    "/v1/info": { "get": { "summary": "Server and device information", "operationId": "info", "responses": { "200": { "description": "Version, device (`cuda`/`cpu`), dtype, loaded models, whether an HF token is set.", "content": { "application/json": { "schema": { "type": "object" } } } } } } },
+    "/v1/models": { "get": { "summary": "List models", "description": "Every model the server knows, with its size, whether its checkpoint is in the local cache (`local`), whether it is loaded in memory, whether it is gated on Hugging Face, and what prompts it accepts.", "operationId": "listModels", "responses": { "200": { "description": "The catalog.", "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/Model" } } } } } } } },
+    "/v1/models/{id}/load": {
+      "post": {
+        "summary": "Load a model",
+        "description": "Downloads the checkpoint if needed and loads it. The optional `weights` path loads a local `.safetensors` file instead (SAM 2 needs `config.json` next to it, SAM 3 `tokenizer.json`).",
+        "operationId": "loadModel",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": { "required": false, "content": { "application/json": { "schema": { "type": "object", "properties": { "weights": { "type": "string" } } } } } },
+        "responses": { "200": { "description": "Loaded.", "content": { "application/json": { "schema": { "type": "object" } } } }, "400": { "$ref": "#/components/responses/Error" }, "404": { "$ref": "#/components/responses/Error" }, "500": { "$ref": "#/components/responses/Error" } }
+      }
+    },
+    "/v1/models/{id}": { "delete": { "summary": "Unload a model", "description": "Frees the model and drops the image and video sessions that belong to it.", "operationId": "unloadModel", "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "Done.", "content": { "application/json": { "schema": { "type": "object" } } } } } } },
+    "/v1/images": {
+      "post": {
+        "summary": "Embed an image",
+        "description": "The body is the image (png, jpeg, webp or bmp). The expensive encoder runs once; use the returned `id` with `/v1/images/{id}/segment` for as many prompts as you like. The server keeps the 16 most recent sessions.",
+        "operationId": "embedImage",
+        "parameters": [{ "name": "model", "in": "query", "required": true, "schema": { "type": "string" }, "description": "A model id from `/v1/models`." }],
+        "requestBody": { "required": true, "content": { "image/*": { "schema": { "type": "string", "format": "binary" } } } },
+        "responses": { "200": { "description": "The session.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ImageSession" } } } }, "400": { "$ref": "#/components/responses/Error" }, "500": { "$ref": "#/components/responses/Error" } }
+      }
+    },
+    "/v1/images/{id}/segment": {
+      "post": {
+        "summary": "Segment with a prompt",
+        "description": "Points and boxes work with every model. SAM 3 also takes `text` and exemplar boxes (`boxes` positive, `neg_boxes` negative) and returns every matching instance (`kind: \"instances\"`); with `points`, or `tracker: true`, it behaves like SAM 2 for one object. Point and box prompts return up to three candidate masks with predicted IoUs (one with `multimask: false`).",
+        "operationId": "segment",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "integer" } }],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SegmentRequest" }, "examples": {
+            "click": { "summary": "One click", "value": { "points": [{ "x": 500, "y": 375 }] } },
+            "box": { "summary": "A box, one mask", "value": { "boxes": [[86, 282, 1710, 851]], "multimask": false } },
+            "concept": { "summary": "SAM 3 concept", "value": { "text": "wheel", "threshold": 0.5 } }
+          } } }
+        },
+        "responses": { "200": { "description": "The masks.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SegmentResponse" } } } }, "400": { "$ref": "#/components/responses/Error" }, "404": { "$ref": "#/components/responses/Error" }, "500": { "$ref": "#/components/responses/Error" } }
+      }
+    },
+    "/v1/images/{id}": { "delete": { "summary": "Drop an image session", "operationId": "deleteImage", "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "integer" } }], "responses": { "200": { "description": "Done.", "content": { "application/json": { "schema": { "type": "object" } } } } } } },
+    "/v1/videos": {
+      "post": {
+        "summary": "Start video tracking",
+        "description": "SAM 2 and SAM 3. Give points and/or a box for one object (they apply to the first frame you send), or, with SAM 3, `text` to find and follow every instance of a concept; the detector re-runs every `detect_every` frames so objects that enter later are picked up. Then POST the frames in order.",
+        "operationId": "startVideo",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/VideoRequest" } } } },
+        "responses": { "200": { "description": "The session.", "content": { "application/json": { "schema": { "type": "object", "properties": { "id": { "type": "integer" }, "model": { "type": "string" } } } } } }, "400": { "$ref": "#/components/responses/Error" }, "500": { "$ref": "#/components/responses/Error" } }
+      }
+    },
+    "/v1/videos/{id}/frames": {
+      "post": {
+        "summary": "Track the next frame",
+        "description": "The body is the next frame, in order. Returns that frame's masks: one object (`id` 0) for a point or box prompt, one per live object for a text prompt.",
+        "operationId": "trackFrame",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "integer" } }],
+        "requestBody": { "required": true, "content": { "image/*": { "schema": { "type": "string", "format": "binary" } } } },
+        "responses": { "200": { "description": "The frame's objects.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/FrameResponse" } } } }, "400": { "$ref": "#/components/responses/Error" }, "404": { "$ref": "#/components/responses/Error" }, "500": { "$ref": "#/components/responses/Error" } }
+      }
+    },
+    "/v1/videos/{id}": { "delete": { "summary": "Drop a video session", "operationId": "deleteVideo", "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "integer" } }], "responses": { "200": { "description": "Done.", "content": { "application/json": { "schema": { "type": "object" } } } } } } },
+    "/health": { "get": { "summary": "Liveness", "operationId": "health", "responses": { "200": { "description": "`ok`", "content": { "text/plain": { "schema": { "type": "string" } } } } } } }
+  },
+  "components": {
+    "responses": { "Error": { "description": "`{ \"error\": message }`", "content": { "application/json": { "schema": { "type": "object", "properties": { "error": { "type": "string" } } } } } } },
+    "schemas": {
+      "Model": { "type": "object", "properties": { "id": { "type": "string" }, "name": { "type": "string" }, "family": { "type": "string" }, "size_mb": { "type": "integer" }, "gated": { "type": "boolean" }, "local": { "type": "boolean" }, "loaded": { "type": "boolean" }, "capabilities": { "type": "object", "properties": { "points": { "type": "boolean" }, "boxes": { "type": "boolean" }, "text": { "type": "boolean" }, "exemplars": { "type": "boolean" }, "video": { "type": "boolean" } } } } },
+      "ImageSession": { "type": "object", "properties": { "id": { "type": "integer" }, "model": { "type": "string" }, "width": { "type": "integer" }, "height": { "type": "integer" }, "encode_ms": { "type": "number" } } },
+      "Point": { "type": "object", "required": ["x", "y"], "properties": { "x": { "type": "number" }, "y": { "type": "number" }, "label": { "type": "integer", "enum": [0, 1], "description": "1 foreground (default), 0 background" } } },
+      "SegmentRequest": { "type": "object", "properties": { "points": { "type": "array", "items": { "$ref": "#/components/schemas/Point" } }, "boxes": { "type": "array", "items": { "type": "array", "items": { "type": "number" }, "minItems": 4, "maxItems": 4 }, "description": "`[x0, y0, x1, y1]`. SAM 3 text mode: positive exemplars." }, "neg_boxes": { "type": "array", "items": { "type": "array", "items": { "type": "number" } }, "description": "SAM 3: negative exemplars." }, "text": { "type": "string", "description": "A concept to find every instance of. SAM 3 does this natively; for every other model SAM 3 is loaded as a detector and the model segments inside each box it finds (needs --max-models 2 or more; SAM 3 is gated)." }, "threshold": { "type": "number", "default": 0.3, "description": "SAM 3: minimum instance score." }, "multimask": { "type": "boolean", "default": true }, "tracker": { "type": "boolean", "description": "SAM 3: treat boxes as a SAM-style prompt for one object." } } },
+      "Result": { "type": "object", "properties": { "id": { "type": ["integer", "null"] }, "score": { "type": "number", "description": "Predicted IoU (points/boxes), detection score (text), or object score (video)." }, "present": { "type": "boolean" }, "area": { "type": "integer" }, "bbox": { "type": ["array", "null"], "items": { "type": "integer" } }, "png": { "type": "string", "description": "Base64 grayscale PNG." } } },
+      "SegmentResponse": { "type": "object", "properties": { "kind": { "type": "string", "enum": ["masks", "instances"] }, "model": { "type": "string" }, "width": { "type": "integer" }, "height": { "type": "integer" }, "object_score": { "type": ["number", "null"], "description": "SAM 2 / SAM 3 tracker: positive means an object is there." }, "decode_ms": { "type": "number" }, "results": { "type": "array", "items": { "$ref": "#/components/schemas/Result" } } } },
+      "VideoRequest": { "type": "object", "required": ["model"], "properties": { "model": { "type": "string" }, "points": { "type": "array", "items": { "$ref": "#/components/schemas/Point" } }, "boxes": { "type": "array", "items": { "type": "array", "items": { "type": "number" } } }, "text": { "type": "string" }, "threshold": { "type": "number", "default": 0.3 }, "detect_every": { "type": "integer", "default": 5 } } },
+      "FrameResponse": { "type": "object", "properties": { "frame": { "type": "integer" }, "width": { "type": "integer" }, "height": { "type": "integer" }, "elapsed_ms": { "type": "number" }, "objects": { "type": "array", "items": { "$ref": "#/components/schemas/Result" } } } }
+    }
+  }
+}

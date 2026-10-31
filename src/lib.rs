@@ -10,5 +10,7 @@ pub mod model;
 pub mod sam1;
 pub mod sam2;
 pub mod sam3;
+#[cfg(feature = "serve")]
+pub mod serve;
 
 pub use model::{Mask, Prompt, Sam, SamVariant};

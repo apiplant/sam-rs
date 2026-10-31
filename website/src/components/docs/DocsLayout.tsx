@@ -23,7 +23,8 @@ const NAV: NavGroup[] = [
     title: "CLI reference",
     items: [
       { label: "sam-rs", href: "/docs/cli" },
-      { label: "Tasks & prompts", href: "/docs/tasks" },
+      { label: "Models & prompts", href: "/docs/models" },
+      { label: "Server & web UI", href: "/docs/serve" },
     ],
   },
 ];

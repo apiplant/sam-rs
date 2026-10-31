@@ -279,9 +279,11 @@ pub struct VideoTracker {
     attn: MemoryAttention,
     obj_ptr: Ff,
     no_obj_ptr: Tensor,
-    tproj: Linear,
+    /// `None` for SAM 2.0 (no temporal position encoding for object pointers: their position embedding is zero)
+    tproj: Option<Linear>,
     mem_tpos: Tensor, // [7, 64]
-    occlusion: Tensor, // [64]
+    /// `None` for SAM 2.0 (no occlusion spatial embedding)
+    occlusion: Option<Tensor>, // [64]
 }
 
 fn sine_pe_1d(pos: &[f32], dim: usize, device: &Device, dt: DType) -> Result<Tensor> {
@@ -301,7 +303,9 @@ impl VideoTracker {
     /// `m` holds `memory_encoder.*`, `memory_attention.*`, `object_pointer_proj.*` and friends (`tracker_model.` in the
     /// SAM 3 checkpoint, the checkpoint root for SAM 2). `max_cond`: how many conditioning frames memory attention may
     /// use (`None` = all).
-    pub fn new(m: VarBuilder, side: usize, img: usize, max_cond: Option<usize>, device: &Device) -> Result<Self> {
+    /// `tpos_ptrs` / `occlusion_embed`: whether the checkpoint has the temporal object-pointer position projection and the
+    /// occlusion embedding (SAM 3 and SAM 2.1 do, SAM 2.0 does not).
+    pub fn new(m: VarBuilder, side: usize, img: usize, max_cond: Option<usize>, tpos_ptrs: bool, occlusion_embed: bool, device: &Device) -> Result<Self> {
         Ok(Self {
             side,
             img,
@@ -310,9 +314,9 @@ impl VideoTracker {
             attn: MemoryAttention::new(m.pp("memory_attention"), side, device)?,
             obj_ptr: Ff::new(D, D, D, 3, false, m.pp("object_pointer_proj"))?,
             no_obj_ptr: m.get((1, D), "no_object_pointer")?.reshape(D)?,
-            tproj: linear(D, MEM, m.pp("temporal_positional_encoding_projection_layer"))?,
+            tproj: if tpos_ptrs { Some(linear(D, MEM, m.pp("temporal_positional_encoding_projection_layer"))?) } else { None },
             mem_tpos: m.get((NUM_MASKMEM, 1, 1, MEM), "memory_temporal_positional_encoding")?.reshape((NUM_MASKMEM, MEM))?,
-            occlusion: m.get((1, MEM), "occlusion_spatial_embedding_parameter")?.reshape(MEM)?,
+            occlusion: if occlusion_embed { Some(m.get((1, MEM), "occlusion_spatial_embedding_parameter")?.reshape(MEM)?) } else { None },
         })
     }
 
@@ -385,7 +389,10 @@ impl VideoTracker {
             let splits = D / MEM;
             let toks = p.reshape((ptrs.len() * splits, MEM))?; // each pointer split into 4 memory-width tokens
             let norm: Vec<f32> = offsets.iter().map(|o| o / (max_ptr as f32 - 1.0)).collect();
-            let pe = self.tproj.forward(&sine_pe_1d(&norm, D, dev, dt)?)?; // [P, 64]
+            let pe = match &self.tproj {
+                Some(t) => t.forward(&sine_pe_1d(&norm, D, dev, dt)?)?, // [P, 64]
+                None => Tensor::zeros((ptrs.len(), MEM), dt, dev)?,
+            };
             let pe = pe.unsqueeze(1)?.broadcast_as((ptrs.len(), splits, MEM))?.reshape((ptrs.len() * splits, MEM))?;
             n_ptr = toks.dim(0)?;
             mems.push(toks);
@@ -407,8 +414,8 @@ impl VideoTracker {
         let m = if from_prompt { big.gt(0f32)?.to_dtype(DType::F32)? } else { candle_nn::ops::sigmoid(&big.to_dtype(DType::F32)?)? };
         let m = ((m * 20.0)? - 10.0)?.to_dtype(dt)?;
         let (mut feat, pos) = self.enc.forward(&tf.raw, &m, self.side)?;
-        if object_score <= 0.0 {
-            feat = feat.broadcast_add(&self.occlusion.to_dtype(dt)?.reshape((1, MEM, 1, 1))?)?;
+        if let (true, Some(occ)) = (object_score <= 0.0, &self.occlusion) {
+            feat = feat.broadcast_add(&occ.to_dtype(dt)?.reshape((1, MEM, 1, 1))?)?;
         }
         let n = self.side * self.side;
         let tok = |t: &Tensor| t.flatten_from(2)?.transpose(1, 2)?.reshape((n, MEM));

@@ -8,14 +8,37 @@ Rust ([candle](https://github.com/huggingface/candle)) inference for the Segment
 | --- | --- |
 | SAM ViT-B / ViT-L / ViT-H (`sam-vit-b`, `sam-vit-l`, `sam-vit-h`) | working, CPU + CUDA |
 | **SAM 2 / 2.1** (Hiera tiny, small, base+, large): points and boxes, video tracking | working, CPU + CUDA |
-| **SAM 3** (`sam3`): text-prompted instance segmentation | working, CPU + CUDA (gated weights, see below) |
-| MobileSAM, EfficientSAM | not implemented yet |
+| **SAM 3** (`sam3`): text-prompted instance segmentation, video tracking (points, boxes or text) | working, CPU + CUDA (gated weights, see below) |
+| **MobileSAM** (`mobile-sam`) | working, CPU + CUDA |
+| **EfficientSAM** (`efficientsam-ti`, `efficientsam-s`) | working, CPU + CUDA |
 
 CUDA encoder time on an RTX 4090, f16, same image: ViT-B 38 ms, ViT-L 74 ms, ViT-H 96 ms (decode adds ~7 ms). ViT-B
 checkpoints load in either the Meta layout (`lmz/candle-sam`) or the Hugging Face `transformers` layout
 (`facebook/sam-vit-*`); ViT-L and ViT-H use the latter. Candidate masks are not in a fixed semantic order across
 checkpoints (index 0 is the whole object for ViT-B but a part for ViT-H), so pick by the predicted IoU or
 inspect all three.
+
+## MobileSAM and EfficientSAM
+
+```sh
+sam-rs --model mobile-sam --image truck.jpg --point 500,375
+sam-rs --model efficientsam-ti --image truck.jpg --point 500,375
+```
+
+MobileSAM (TinyViT-5M encoder + SAM ViT-B decoder) matches candle-transformers' reference encoder to 1.4e-6 (using the
+tanh GELU that reference uses; the model itself uses the exact GELU, which is the default here). About 18 ms on the
+4090 and ~0.5 s on CPU. Depthwise convolutions run on a dedicated kernel because candle's grouped convolution launches
+per-channel kernels.
+
+EfficientSAM was ported against the ONNX exports run through onnxruntime (`scripts/ref_efficientsam.py`,
+`examples/efficientsam_parity.rs`): ViT-Ti matches on every prompt type, with low-res masks to 1.6e-5 and IoU scores to six
+digits. ViT-S loads and runs but has no reference check. The upstream checkpoints are PyTorch `.pt` files; `sam-rs`
+downloads them from `yunyangx/EfficientSAM` on first use and converts them once to a `.safetensors` file next to
+the `.pt` (f32, using candle's pickle reader, which only builds tensors and never executes pickled code), so like the
+other models it needs no manual step. `scripts/convert_efficientsam.py` still does the same conversion in Python.
+
+ViT-Ti: ~21 ms encoder + ~7 ms decode on CUDA f16; ~0.29 s encoder on CPU (the bf16 kernels where the CPU has them;
+about 1.3 s in exact f32). The prompt is always padded to exactly 6 points, as in the reference graph.
 
 ## SAM 2 / 2.1
 
@@ -43,12 +66,12 @@ on every frame and mask logits to ~4e-6.
 | sam-rs CUDA f16 + FlashAttention, 2.1 small / base+ / large | 16 / 24 / 44 ms | 6.5 ms | ~23 / 30 / 50 ms |
 | sam-rs CUDA f16, plain attention, 2.1 tiny / large | 23 / 64 ms | 6.5 ms | ~29 / 70 ms |
 | osam 0.9.2, CPU provider (ONNX), `sam2:tiny` | 678 ms | 27 ms | 705 ms |
-| sam-rs CPU (bf16 kernels), 2.1 tiny | 650 ms | 42 ms | ~692 ms |
-| sam-rs CPU (bf16 kernels), 2.1 large | 2120 ms | 42 ms | ~2.2 s |
+| sam-rs CPU (bf16 kernels), 2.1 tiny | 421 ms | 42 ms | ~463 ms |
+| sam-rs CPU (bf16 kernels), 2.1 large | 1800 ms | 42 ms | ~1.85 s |
 
-On CPU the tiny model is only at parity with osam (about 2% faster): the high-resolution early Hiera blocks and the
-neck are limited by single-threaded layout copies in candle, not by arithmetic, and that optimization pass has not
-been done. osam's larger SAM 2 models were not benchmarked (their download had not finished). Video: about 42-50 ms
+On CPU the tiny model is about 1.5x faster than osam. The layout changes around the Hiera blocks (QKV split, window
+pooling, NCHW/NHWC conversions) were single-threaded candle copies and now run as parallel kernels
+(`tests/cpu_layout.rs` checks them against the tensor ops); the large model is dominated by the GEMMs. osam's larger SAM 2 models were not benchmarked (their download had not finished). Video: about 42-50 ms
 per frame for 2.1 tiny on CUDA f16 including PNG decoding.
 
 ## SAM 3: segment every instance of a concept
@@ -105,11 +128,59 @@ in the conditioned features is bf16 rounding of the stored memories (PyTorch kee
 upstream difference occasionally flips an entry by a whole bf16 step). Speed, RTX 4090, f16 + FlashAttention: about
 85-100 ms per frame including PNG decoding; CPU bf16: 3-4 s per frame.
 
-Limits (SAM 3 and SAM 2 video): one object per session (run several sessions for several objects); forward tracking only (no reverse or
-re-conditioning pass); mask prompts are not ported; and `Sam3VideoModel`'s text-prompted detection + tracking with
-automatic object association is not ported. Frames are squashed to 1008x1008 like the image model.
+#### Text-prompted detect-and-track
+
+Give `--text` instead of a point or box and every instance of the concept is found and followed:
+
+```sh
+sam-rs --model sam3 --video frames/ --text "wheel" --detect-every 5 --out masks/
+```
+
+The detector runs on the first frame and then every `--detect-every` frames; each detection that no live track
+explains (mask IoU < 0.5) starts a tracker session seeded with its box, so objects that enter later are picked up.
+A track absent for 8 frames in a row is dropped. One `<frame>_obj<ID>_mask.png` is written per object and frame. In
+code: `sam3::text_track::TextTracker::new(&sam, "wheel", 0.3).detect_every(5)` and `step(&frame)` per frame.
+The association is a greedy mask-IoU rule, not `Sam3VideoModel`'s matching logic, and it has not been compared with the
+reference, so identities can differ from it in crowded or heavily occluded scenes (on a 10-frame pan over `truck.jpg`
+it finds three wheels on frame 0, picks up a fourth when it enters, and keeps the ids stable). About 130-350 ms per
+frame on CUDA f16 (detector frames cost more), 3-4 s on CPU.
+
+Limits (SAM 3 and SAM 2 video): one object per point/box session (run several sessions for several objects); forward
+tracking only (no reverse or re-conditioning pass); mask prompts are not ported. Frames are squashed to 1008x1008 like
+the image model.
 
 For the best CUDA speed build with `--features flash-attn` (first build takes several minutes).
+
+## Server and web UI
+
+```sh
+sam-rs serve                                  # http://127.0.0.1:8080: web UI at /, API reference at /docs
+sam-rs serve --addr 0.0.0.0:9000 --preload sam2.1-hiera-tiny --max-models 3
+```
+
+One HTTP API (ntex) in front of every model, and a web UI (Solid 2, in `ui/`, embedded in the binary) to use it:
+pick a model (downloaded ones first, with a toggle for the rest), open or paste an image, click for points
+(right-click or alt for background), drag for boxes (shift-drag excludes, SAM 3), type a concept for SAM 3, and
+drop a clip or a set of frames in Video mode to track objects through it. `--no-download` limits the server to
+models already in the cache, and "Load local weights" loads a `.safetensors` path on the server.
+
+The models live on one worker thread (the GPU is single-tenant), so requests queue; models load on first use and the
+least recently used is dropped past `--max-models` (default 2). The API embeds an image once and decodes prompts against
+that session, which is what makes interactive clicking fast (SAM ViT-B on an RTX 4090: ~45 ms to embed, ~25 ms per
+prompt including PNG encoding):
+
+```sh
+curl -s localhost:8080/v1/models                                             # catalog: local / loaded / gated, capabilities
+id=$(curl -s -X POST --data-binary @truck.jpg 'localhost:8080/v1/images?model=sam2.1-hiera-tiny' | jq .id)
+curl -s -X POST -d '{"points":[{"x":500,"y":375}]}' localhost:8080/v1/images/$id/segment   # masks as base64 PNGs
+curl -s -X POST -d '{"text":"wheel","threshold":0.5}' localhost:8080/v1/images/$(curl -s -X POST --data-binary @truck.jpg 'localhost:8080/v1/images?model=sam3' | jq .id)/segment
+v=$(curl -s -X POST -d '{"model":"sam3","text":"wheel"}' localhost:8080/v1/videos | jq .id)       # video tracking session
+curl -s -X POST --data-binary @frame00.jpg localhost:8080/v1/videos/$v/frames                   # then each frame in order
+```
+
+`GET /openapi.json` is the full description. The UI is built with `pnpm install && pnpm build` in `ui/` (`SAM_RS_REQUIRE_UI=1`
+makes `cargo build` fail without it; release builds set it) and embedded by `build.rs`; `pnpm dev` there proxies to a
+running server. Build without the server and its dependencies with `--no-default-features`.
 
 ## Build
 

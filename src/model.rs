@@ -37,7 +37,8 @@ impl SamVariant {
         }
     }
 
-    fn weights(self) -> (&'static str, &'static str) {
+    /// Hugging Face `(repo, file)` of the checkpoint.
+    pub fn weights(self) -> (&'static str, &'static str) {
         match self {
             Self::VitB => ("lmz/candle-sam", "sam_vit_b_01ec64.safetensors"),
             Self::VitL => ("facebook/sam-vit-large", "model.safetensors"),

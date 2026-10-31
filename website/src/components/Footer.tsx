@@ -16,7 +16,8 @@ const COLUMNS = [
     links: [
       { label: "Library", href: "/docs/library" },
       { label: "sam-rs CLI", href: "/docs/cli" },
-      { label: "Tasks & prompts", href: "/docs/tasks" },
+      { label: "Models & prompts", href: "/docs/models" },
+      { label: "Server & web UI", href: "/docs/serve" },
     ],
   },
   {
@@ -54,11 +55,11 @@ export function Footer() {
           <div class="flex items-center gap-2">
             <ChipMark class="h-7 w-7" />
             <span class="text-[0.9375rem] font-semibold tracking-tight text-ink">
-              sam-rs<span class="text-accent">-rs</span>
+              sam<span class="text-accent">-rs</span>
             </span>
           </div>
           <p class="mt-3 max-w-xs text-sm leading-relaxed text-faint">
-            Rust inference for nvidia/Segment Anything: detect, ground, point, read and click. One binary, CPU or CUDA, no Python.
+            Rust inference for the Segment Anything family: SAM, MobileSAM, EfficientSAM, SAM 2 and SAM 3, with video tracking. One binary, CPU or CUDA, no Python.
           </p>
         </div>
 

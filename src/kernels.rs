@@ -43,7 +43,7 @@ pub fn relpos_softmax(scores: &Tensor, q: &Tensor, table: &Tensor, h: usize, w: 
 }
 
 mod cpu {
-    use candle_core::{bail, CpuStorage, CustomOp2, CustomOp3, Layout, Result, Shape};
+    use candle_core::{bail, CpuStorage, CustomOp1, CustomOp2, CustomOp3, Layout, Result, Shape};
     use rayon::prelude::*;
 
     /// Same math as the CUDA kernel: bias vectors from `q` and the tables, then a row softmax, one row per task.
@@ -663,6 +663,142 @@ mod cpu {
             Ok((CpuStorage::F32(out), yl.shape().clone()))
         }
     }
+
+    /// `y: [T, 3C]` + `bias[3C]` -> `[3, T, C]` (q, k, v planes), one task per token.
+    pub struct BiasSplit3;
+
+    impl CustomOp2 for BiasSplit3 {
+        fn name(&self) -> &'static str {
+            "bias-split3"
+        }
+
+        fn cpu_fwd(&self, y: &CpuStorage, yl: &Layout, b: &CpuStorage, bl: &Layout) -> Result<(CpuStorage, Shape)> {
+            let (y, b) = (f32s(y, yl)?, f32s(b, bl)?);
+            let c = b.len() / 3;
+            let t = y.len() / (3 * c);
+            let mut out = vec![0f32; y.len()];
+            let base = SendPtr(out.as_mut_ptr());
+            (0..t).into_par_iter().for_each(|i| {
+                for which in 0..3 {
+                    for k in 0..c {
+                        // SAFETY: (which, i, k) uniquely determines the destination element.
+                        unsafe { *base.at((which * t + i) * c + k) = y[i * 3 * c + which * c + k] + b[which * c + k] };
+                    }
+                }
+            });
+            Ok((CpuStorage::F32(out), Shape::from((3, t, c))))
+        }
+    }
+
+    /// NCHW `[1, C, H, W]` -> NHWC `[1, H, W, C]`, optionally adding an NHWC tensor of the same shape.
+    pub struct NchwToNhwc;
+
+    impl CustomOp2 for NchwToNhwc {
+        fn name(&self) -> &'static str {
+            "nchw-to-nhwc"
+        }
+
+        fn cpu_fwd(&self, a: &CpuStorage, al: &Layout, b: &CpuStorage, bl: &Layout) -> Result<(CpuStorage, Shape)> {
+            let (a, b) = (f32s(a, al)?, f32s(b, bl)?);
+            let (_, c, h, w) = al.shape().dims4()?;
+            let hw = h * w;
+            let mut out = vec![0f32; a.len()];
+            out.par_chunks_mut(c).enumerate().for_each(|(p, o)| {
+                for ch in 0..c {
+                    o[ch] = a[ch * hw + p] + b[p * c + ch];
+                }
+            });
+            Ok((CpuStorage::F32(out), Shape::from((1, h, w, c))))
+        }
+    }
+
+    /// NHWC `[1, H, W, C]` -> NCHW `[1, C, H, W]`.
+    pub struct NhwcToNchw;
+
+    impl CustomOp1 for NhwcToNchw {
+        fn name(&self) -> &'static str {
+            "nhwc-to-nchw"
+        }
+
+        fn cpu_fwd(&self, a: &CpuStorage, al: &Layout) -> Result<(CpuStorage, Shape)> {
+            let a = f32s(a, al)?;
+            let (_, h, w, c) = al.shape().dims4()?;
+            let hw = h * w;
+            let mut out = vec![0f32; a.len()];
+            out.par_chunks_mut(hw).enumerate().for_each(|(ch, o)| {
+                for (p, v) in o.iter_mut().enumerate() {
+                    *v = a[p * c + ch];
+                }
+            });
+            Ok((CpuStorage::F32(out), Shape::from((1, c, h, w))))
+        }
+    }
+
+    /// Max pool with kernel = stride = `s` over NHWC `[B, H, W, C]` (H, W divisible by `s`).
+    pub struct MaxPoolNhwc {
+        pub s: usize,
+    }
+
+    impl CustomOp1 for MaxPoolNhwc {
+        fn name(&self) -> &'static str {
+            "maxpool-nhwc"
+        }
+
+        fn cpu_fwd(&self, a: &CpuStorage, al: &Layout) -> Result<(CpuStorage, Shape)> {
+            let a = f32s(a, al)?;
+            let (b, h, w, c) = al.shape().dims4()?;
+            let (s, oh, ow) = (self.s, h / self.s, w / self.s);
+            let mut out = vec![f32::NEG_INFINITY; b * oh * ow * c];
+            out.par_chunks_mut(ow * c).enumerate().for_each(|(row, o)| {
+                let (bi, y) = (row / oh, row % oh);
+                for x in 0..ow {
+                    let dst = &mut o[x * c..(x + 1) * c];
+                    for dy in 0..s {
+                        for dx in 0..s {
+                            let src = &a[((bi * h + y * s + dy) * w + x * s + dx) * c..][..c];
+                            for (d, v) in dst.iter_mut().zip(src) {
+                                *d = d.max(*v);
+                            }
+                        }
+                    }
+                }
+            });
+            Ok((CpuStorage::F32(out), Shape::from((b, oh, ow, c))))
+        }
+    }
+}
+
+/// `y: [T, 3C]` (qkv projection output without bias) + `bias[3C]` -> `[3, T, C]`: q, k, v planes with the bias added.
+pub fn bias_split3(y: &Tensor, bias: &Tensor) -> Result<Tensor> {
+    if y.device().is_cpu() && y.dtype() == candle_core::DType::F32 {
+        return y.contiguous()?.apply_op2_no_bwd(&bias.contiguous()?, &cpu::BiasSplit3);
+    }
+    let (t, c3) = y.dims2()?;
+    y.broadcast_add(bias)?.reshape((t, 3, c3 / 3))?.permute((1, 0, 2))?.contiguous()
+}
+
+/// `[1, C, H, W]` -> `[1, H, W, C]` plus `add` (an NHWC tensor of that shape).
+pub fn nchw_to_nhwc_add(x: &Tensor, add: &Tensor) -> Result<Tensor> {
+    if x.device().is_cpu() && x.dtype() == candle_core::DType::F32 && add.dtype() == candle_core::DType::F32 {
+        return x.contiguous()?.apply_op2_no_bwd(&add.contiguous()?, &cpu::NchwToNhwc);
+    }
+    x.permute((0, 2, 3, 1))?.broadcast_add(&add.to_dtype(x.dtype())?)
+}
+
+/// `[1, H, W, C]` -> contiguous `[1, C, H, W]`.
+pub fn nhwc_to_nchw(x: &Tensor) -> Result<Tensor> {
+    if x.device().is_cpu() && x.dtype() == candle_core::DType::F32 && x.dim(0)? == 1 {
+        return x.contiguous()?.apply_op1_no_bwd(&cpu::NhwcToNchw);
+    }
+    x.permute((0, 3, 1, 2))?.contiguous()
+}
+
+/// Max pool (kernel = stride = `s`) over an NHWC tensor with `H`, `W` divisible by `s`.
+pub fn maxpool_nhwc(x: &Tensor, s: usize) -> Result<Tensor> {
+    if x.device().is_cpu() && x.dtype() == candle_core::DType::F32 {
+        return x.contiguous()?.apply_op1_no_bwd(&cpu::MaxPoolNhwc { s });
+    }
+    x.permute((0, 3, 1, 2))?.contiguous()?.max_pool2d(s)?.permute((0, 2, 3, 1))?.contiguous()
 }
 
 /// `y: [T, 3*nh*hd]` (bias-free qkv projection of `T = windows * n` tokens) -> `(q, kᵀ, v)` with shapes

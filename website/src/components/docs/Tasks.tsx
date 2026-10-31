@@ -1,56 +1,68 @@
 import { DocsLayout } from "./DocsLayout";
 import { H1, H2, Lead, P, IC, Pre, Section, FlagTable } from "./Prose";
 
-export function DocsTasks() {
+export function DocsModels() {
   return (
     <DocsLayout>
-      <H1>Tasks &amp; prompts</H1>
+      <H1>Models &amp; prompts</H1>
       <Lead>
-        The model takes one prompt format for everything. A task is just a template around your query; use{" "}
-        <IC>--task raw</IC> to send your own prompt verbatim.
+        Choose a family with <IC>--model</IC>. They all take points and boxes in image pixels; SAM 3 also takes
+        text and exemplar boxes, and SAM 2 and SAM 3 track through video.
       </Lead>
 
       <Section>
-        <H2>Tasks</H2>
+        <H2>Models</H2>
         <FlagTable
           rows={[
-            { flag: "detect", meaning: <>Detection or layout analysis. The query is a comma-separated category list, joined with <IC>{"</c>"}</IC>: <IC>Locate all the instances that matches the following description: person{"</c>"}car.</IC></> },
-            { flag: "ground", meaning: <>Phrase grounding, all matching instances: <IC>Locate all the instances that match the following description: Q.</IC></> },
-            { flag: "ground-single", meaning: <>Phrase grounding, one instance: <IC>Locate a single instance that matches the following description: Q.</IC></> },
-            { flag: "text", meaning: <>Locate a piece of text: <IC>Please locate the text referred as Q.</IC></> },
-            { flag: "detect-text", meaning: <>Scene-text detection, no query: <IC>Detect all the text in box format.</IC></> },
-            { flag: "gui", meaning: <>GUI element grounding, as a box: <IC>Locate the region that matches the following description: Q.</IC></> },
-            { flag: "point", meaning: <>Pointing, and GUI grounding as a point: <IC>Point to: Q.</IC></> },
-            { flag: "raw", meaning: "The query is sent as the prompt, unchanged." },
+            { flag: "sam-vit-b / -l / -h", meaning: "Segment Anything: points and boxes, three candidate masks. 375 MB to 2.5 GB. ViT-B loads in the Meta or the transformers layout; ViT-L and ViT-H use the transformers one." },
+            { flag: "mobile-sam", meaning: "MobileSAM: a TinyViT-5M encoder with the SAM ViT-B decoder. About 18 ms on an RTX 4090 and 0.5 s on the CPU." },
+            { flag: "efficientsam-ti / -s", meaning: "EfficientSAM ViT-Tiny and ViT-Small. The upstream .pt checkpoints are downloaded and converted to safetensors once, automatically. ViT-Ti: 21 ms encoder on CUDA, 0.3 s on the CPU." },
+            { flag: "sam2.1-hiera-{tiny,small,base-plus,large}", meaning: <>SAM 2.1; <IC>sam2-hiera-*</IC> are the original SAM 2 weights. Points, boxes and video tracking. 160 to 900 MB.</> },
+            { flag: "sam3", meaning: "SAM 3: text-prompted instance segmentation (score, box and mask per instance), exemplar boxes, a SAM-style tracker and video. 3.4 GB, gated on Hugging Face." },
           ]}
         />
       </Section>
 
       <Section>
-        <H2>What the model answers</H2>
+        <H2>Points, boxes and candidates</H2>
         <P>
-          Boxes and points come back as tokens with integer coordinates in [0, 1000], relative to the image. The
-          binary parses them into pixel coordinates of the original image.
+          A point is <IC>x,y</IC>, a background point <IC>x,y,0</IC>; a box is <IC>x0,y0,x1,y1</IC>. The model
+          returns three candidate masks with a predicted IoU each (one with <IC>--single</IC>), because a click
+          is ambiguous: it can mean a part, an object or the thing the object is on. In code,{" "}
+          <IC>Prompt::Points</IC> and <IC>Prompt::Box</IC> carry the same values.
         </P>
-        <Pre caption="--task ground-single -q &quot;the cat sleeping on the right&quot;" lang="text">{`<ref>the cat sleeping on the right</ref><box><541><52><998><775></box>`}</Pre>
-        <Pre caption="detections" lang="json">{`{"kind":"box","label":"the cat sleeping on the right","x1":346.24,"y1":24.96,"x2":638.72,"y2":372.0}`}</Pre>
-        <P>Pointing answers with two coordinates instead of four, on a 640x480 image:</P>
-        <Pre caption="--task point -q &quot;the cat on the left&quot;" lang="text">{`<ref>the cat on the left</ref><box><254><390></box>
-{"kind":"point","label":"the cat on the left","x":162.56,"y":187.2}`}</Pre>
-        <P>
-          A category with nothing to find is answered with <IC>{"<box>None</box>"}</IC> and produces no
-          detection.
-        </P>
+        <Pre caption="--point 500,375 on truck.jpg" lang="text">{`object score 19.36 (object present)
+mask 0: iou 0.042, area 631329
+mask 1: iou 0.952, area 22109
+mask 2: iou 0.493, area 46080`}</Pre>
       </Section>
 
       <Section>
-        <H2>Parallel Box Decoding</H2>
+        <H2>SAM 3 concepts</H2>
         <P>
-          Instead of emitting a box as four sequential coordinate tokens, the model predicts them in 6-token
-          blocks (multi-token prediction), so a dense scene needs far fewer forward steps. In{" "}
-          <IC>hybrid</IC> mode the runtime falls back to one-token auto-regressive steps whenever a block is
-          malformed or uncertain; <IC>fast</IC> never falls back, <IC>slow</IC> never uses MTP. The step trace
-          (<IC>-v</IC>) shows which was used for each step.
+          <IC>--text</IC> takes a short noun phrase and returns every matching instance whose score is above{" "}
+          <IC>--threshold</IC>. Exemplar boxes mean &ldquo;find more like this&rdquo;; they work alone (the text
+          defaults to <IC>visual</IC>) or combined with text, and <IC>--neg-box</IC> excludes what a box shows.
+        </P>
+        <Pre caption="three ways to prompt SAM 3" lang="bash">{`sam-rs --model sam3 --text "wheel" --image truck.jpg --threshold 0.5
+sam-rs --model sam3 --text wheel --box 443,626,676,852 --image truck.jpg
+sam-rs --model sam3 --point 500,375 --image truck.jpg      # SAM-style, one object (the tracker)`}</Pre>
+      </Section>
+
+      <Section>
+        <H2>Video</H2>
+        <P>
+          Frames are read from a directory of images sorted by name; <IC>ffmpeg -i clip.mp4 frames/%05d.png</IC>{" "}
+          extracts them. A point or box on one frame follows one object forward through the clip (SAM 2 and SAM
+          3). With SAM 3 and <IC>--text</IC>, the detector finds every instance on the first frame and then every{" "}
+          <IC>--detect-every</IC> frames; each detection that no live track explains starts a new tracker
+          session, and a track absent for 8 frames in a row is dropped. One mask PNG per object and frame is
+          written.
+        </P>
+        <P>
+          The text-prompted association is a greedy mask-IoU rule rather than the reference model&apos;s matching
+          logic, and it has not been compared with the reference, so identities can differ from it in crowded or
+          heavily occluded scenes. Tracking runs forward only; mask prompts are not ported.
         </P>
       </Section>
     </DocsLayout>

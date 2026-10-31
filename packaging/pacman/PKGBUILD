@@ -17,8 +17,8 @@ depends=()
 # the PKGBUILD work on its own once the release is published.
 source=("$pkgname-$pkgver-x86_64.tar.gz::$url/releases/download/v$pkgver/sam-rs-v$pkgver-x86_64-unknown-linux-gnu.tar.gz")
 sha256sums=('@SHA_LINUX_X86_64@')
-# The release profile already strips symbols, and makepkg's strip pass on an
-# LTO'd binary buys nothing.
+# The release profile already strips symbols, and makepkg's strip pass
+# would buy nothing.
 options=('!strip' '!debug')
 
 package() {

@@ -115,7 +115,7 @@ export function Wordmark(props: { class?: string }) {
     <span class={`inline-flex min-w-0 items-center gap-2 ${props.class ?? ""}`}>
       <ChipMark class="h-6 w-6" />
       <span class="truncate text-[0.9375rem] font-semibold tracking-tight text-ink">
-        sam-rs<span class="text-accent">-rs</span>
+        sam<span class="text-accent">-rs</span>
       </span>
     </span>
   );

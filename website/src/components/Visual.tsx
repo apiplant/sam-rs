@@ -1,21 +1,19 @@
-/** An illustration of what the model returns: labelled boxes and a point over a scene, drawn in SVG so it
+/** An illustration of what the models return: a click on a scene and the masks it selects, drawn in SVG so it
  * follows the site theme and ships no third-party image. It is a drawing, not model output. */
 
-const BOXES = [
-  { label: "person", x: 92, y: 118, w: 54, h: 132, hue: "#e6194b" },
-  { label: "person", x: 168, y: 130, w: 46, h: 120, hue: "#e6194b" },
-  { label: "car", x: 262, y: 168, w: 150, h: 82, hue: "#3cb44b" },
-  { label: "bicycle", x: 440, y: 186, w: 88, h: 64, hue: "#0082c8" },
+const MASKS = [
+  { label: "wheel 0.94", hue: "#e6194b", shape: <><circle cx="306" cy="246" r="14" /><circle cx="368" cy="246" r="14" /></> },
+  { label: "person 0.97", hue: "#3cb44b", shape: <><rect x="106" y="124" width="26" height="128" rx="10" /><rect x="179" y="136" width="24" height="116" rx="10" /></> },
 ];
 
 export function Visual() {
   return (
     <div class="min-w-0 overflow-hidden rounded-xl border border-line bg-surface">
       <div class="flex items-center justify-between border-b border-line px-4 py-2.5">
-        <span class="font-mono text-xs text-faint">Parallel Box Decoding · illustration</span>
-        <span class="font-mono text-xs text-faint">&lt;ref&gt;car&lt;/ref&gt;&lt;box&gt;…</span>
+        <span class="font-mono text-xs text-faint">point → mask · illustration</span>
+        <span class="font-mono text-xs text-faint">--point 340,225</span>
       </div>
-      <svg viewBox="0 0 600 300" class="block w-full" role="img" aria-label="Illustration of detection boxes drawn over a street scene">
+      <svg viewBox="0 0 600 300" class="block w-full" role="img" aria-label="Illustration of a clicked point selecting a car, and concept masks over a street scene">
         {/* sky and ground */}
         <rect width="600" height="300" class="fill-surface-2" />
         <rect y="250" width="600" height="50" class="fill-surface-3" />
@@ -60,23 +58,27 @@ export function Visual() {
           <circle cx="510" cy="228" r="20" />
           <path d="M462 228l22-30h16l10 30M484 198l-6-8h-10" />
         </g>
-        {/* detections */}
-        {BOXES.map((b) => (
-          <g>
-            <rect x={b.x} y={b.y} width={b.w} height={b.h} fill="none" stroke={b.hue} stroke-width="2.5" stroke-dasharray="6 3" rx="2" />
-            <rect x={b.x} y={b.y - 18} width={b.label.length * 7.4 + 12} height="18" fill={b.hue} rx="2" />
-            <text x={b.x + 6} y={b.y - 5} font-size="11" font-family="ui-monospace, monospace" fill="#fff">
-              {b.label}
-            </text>
+        {/* the object selected by a click */}
+        <g class="fill-accent" fill-opacity="0.35" stroke-width="2.5">
+          <rect x="272" y="206" width="130" height="38" rx="9" class="stroke-accent" />
+          <path d="M296 206l18-28h56l18 28z" class="stroke-accent" />
+        </g>
+        <g>
+          <circle cx="340" cy="212" r="12" fill="none" class="stroke-ink" stroke-width="2" />
+          <circle cx="340" cy="212" r="3.5" class="fill-ink" />
+        </g>
+        {/* concept masks, as SAM 3 returns for a text prompt */}
+        {MASKS.map((m) => (
+          <g fill={m.hue} fill-opacity="0.45" stroke={m.hue} stroke-width="2">
+            {m.shape}
           </g>
         ))}
-        {/* a point, as "point" mode returns */}
-        <g>
-          <circle cx="554" cy="130" r="14" fill="none" class="stroke-accent" stroke-width="2" />
-          <circle cx="554" cy="130" r="4" class="fill-accent" />
-          <text x="478" y="40" font-size="11" font-family="ui-monospace, monospace" class="fill-accent">
-            point: the window
-          </text>
+        <g font-size="11" font-family="ui-monospace, monospace">
+          <rect x="92" y="104" width="86" height="18" rx="2" fill="#3cb44b" />
+          <text x="98" y="117" fill="#fff">person 0.97</text>
+          <rect x="268" y="262" width="76" height="18" rx="2" fill="#e6194b" />
+          <text x="274" y="275" fill="#fff">wheel 0.94</text>
+          <text x="404" y="170" class="fill-accent">click → mask 0.95</text>
         </g>
       </svg>
     </div>

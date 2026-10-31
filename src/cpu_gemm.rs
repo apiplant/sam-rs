@@ -182,6 +182,24 @@ unsafe fn block(_: &PackedB, _: &[f32], _: usize, _: &mut [f32]) {
     unreachable!("bf16 kernels need x86_64")
 }
 
+// The fused attention helpers below are AVX-512 only. They are reachable solely behind `enabled()`, which is false
+// off x86_64, but the callers still have to compile there (aarch64 release builds).
+#[cfg(not(target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn rel_bias(_: &[f32], _: &[f32], _: &[f32], _: usize, _: usize, _: usize, _: usize, _: usize, _: &mut [f32], _: &mut [f32]) {
+    unreachable!("bf16 kernels need x86_64")
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub unsafe fn softmax_row(_: &mut [f32], _: &[f32], _: &[f32], _: usize, _: usize, _: f32) {
+    unreachable!("bf16 kernels need x86_64")
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub unsafe fn softmax_scaled(_: &mut [f32], _: f32) {
+    unreachable!("bf16 kernels need x86_64")
+}
+
 /// A bias-free linear layer (`x @ w`, `w: [in, out]`) that uses the bf16 kernel when the weights live on a
 /// capable CPU and the path is enabled, and an ordinary matmul otherwise.
 pub struct Linear {

@@ -5,6 +5,7 @@ pub mod detr;
 pub mod geometry;
 pub mod nn;
 pub mod text;
+pub mod text_track;
 pub mod tracker;
 pub mod video;
 pub mod vision;
@@ -76,7 +77,7 @@ impl Sam3 {
             geometry: geometry::GeometryEncoder::new(d.pp("geometry_encoder"))?,
             tracker: tracker::Tracker::new(vb.pp("tracker_model"), SIDE, SIZE, device, dtype)?,
             tracker_neck: vision::VisionEncoder::tracker_neck(vb.pp("tracker_neck"))?,
-            video: video::VideoTracker::new(vb.pp("tracker_model"), SIDE, SIZE, Some(4), device)?,
+            video: video::VideoTracker::new(vb.pp("tracker_model"), SIDE, SIZE, Some(4), true, true, device)?,
             pos72: vision::sine_pos(SIDE, SIDE, device, dtype)?.flatten_from(2)?.transpose(1, 2)?.contiguous()?,
             tokenizer: tk,
             device: device.clone(),

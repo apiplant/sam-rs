@@ -82,11 +82,13 @@ impl Sam2 {
     pub fn from_dir(config: &std::path::Path, weights: &std::path::Path, device: &Device, dtype: DType) -> Result<Self> {
         let cfg: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(config).with_context(|| format!("reading {}", config.display()))?)?;
         let hc = hiera::HieraConfig::from_json(&cfg)?;
+        // SAM 2.1 turns these on; the original SAM 2.0 checkpoints have neither tensor
+        let flag = |k: &str| cfg.get(k).and_then(|v| v.as_bool()).unwrap_or(true);
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights], dtype, device)? };
         Ok(Self {
             enc: hiera::Hiera::new(&hc, vb.clone(), SIZE, device)?,
             tracker: Tracker::new(vb.clone(), SIDE, SIZE, device, dtype)?,
-            video: VideoTracker::new(vb, SIDE, SIZE, None, device)?,
+            video: VideoTracker::new(vb, SIDE, SIZE, None, flag("enable_temporal_pos_encoding_for_object_pointers"), flag("enable_occlusion_spatial_embedding"), device)?,
             pos: hiera::level_pos(SIDE, 256, device, dtype)?,
             device: device.clone(),
             dtype,

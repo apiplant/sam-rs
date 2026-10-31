@@ -7,10 +7,10 @@ export function DocsCli() {
     <DocsLayout>
       <H1>sam-rs</H1>
       <Lead>
-        Load the model, run one task on one image, print the answer and the detections in pixel space.{" "}
-        <IC>--task</IC> picks how your <IC>--query</IC> becomes a prompt; see{" "}
-        <a href="/docs/tasks" class="text-accent hover:text-accent-dim">
-          Tasks &amp; prompts
+        Load a model, prompt it with points, a box or text, print the candidate masks and save the best one. The
+        prompts each model accepts are listed under{" "}
+        <a href="/docs/models" class="text-accent hover:text-accent-dim">
+          Models &amp; prompts
         </a>
         .
       </Lead>
@@ -18,17 +18,24 @@ export function DocsCli() {
       <Section>
         <H2>Examples</H2>
         <CopyBlock
-          command={`# detection (comma-separated categories -> joined with </c>)
-sam-rs --image street.jpg --task detect -q "person, car, bicycle" --draw out.png
+          command={`# one foreground point, three candidate masks, the best saved as a PNG
+sam-rs --image truck.jpg --point 500,375 --out mask.png
 
-# referring expression / pointing / OCR / GUI
-sam-rs --image img.jpg --task ground -q "people wearing red shirts"
-sam-rs --image img.jpg --task point  -q "the traffic light"
-sam-rs --image img.jpg --task detect-text
-sam-rs --image ui.png  --task gui    -q "the search button"
+# several points (a trailing 0 marks a background point), or a box
+sam-rs --image truck.jpg --point 500,375 --point 1250,600,0
+sam-rs --image truck.jpg --box 75,275,1725,850 --single
 
-# JSON output, greedy, pure-AR decoding, step trace
-sam-rs --image img.jpg -q "ship" --json --temperature 0 --mode slow -v`}
+# other models
+sam-rs --model sam-vit-h --image truck.jpg --point 500,375 --index 0
+sam-rs --model mobile-sam --image truck.jpg --point 500,375
+sam-rs --model sam2.1-hiera-large --image truck.jpg --box 86,282,1710,851
+
+# SAM 3: every instance of a concept
+sam-rs --model sam3 --text "wheel" --image truck.jpg --threshold 0.5
+
+# video: a directory of frames, sorted by name
+sam-rs --model sam2.1-hiera-tiny --video frames/ --point 500,375 --out masks/
+sam-rs --model sam3 --video frames/ --text "wheel" --out masks/`}
         />
       </Section>
 
@@ -36,27 +43,31 @@ sam-rs --image img.jpg -q "ship" --json --temperature 0 --mode slow -v`}
         <H2>Options</H2>
         <FlagTable
           rows={[
-            { flag: "--image FILE", meaning: "The image to search (jpeg, png, webp, bmp)." },
-            { flag: "--task NAME", meaning: "detect, ground, ground-single, text, detect-text, gui, point or raw. Default: detect." },
-            { flag: "-q, --query TEXT", meaning: <>What to look for. Required for every task except <IC>detect-text</IC>.</> },
-            { flag: "--model DIR", meaning: "A local model directory (a clone of nvidia/Segment Anything). Without it the checkpoint is downloaded into the cache directory on first use and reused." },
-            { flag: "--mode fast|slow|hybrid", meaning: "fast: MTP blocks only. slow: pure auto-regressive. hybrid (default): MTP first, AR fallback on malformed or uncertain boxes." },
-            { flag: "--draw FILE", meaning: "Write a copy of the image with the detections drawn on it, one colour per label." },
-            { flag: "--json", meaning: "Print prompt, answer, detections and stats as JSON instead of the readable summary." },
-            { flag: "--max-patches N", meaning: "Vision budget in 14x14 patches before downscaling (default 25600, about 6400 LLM tokens). Lower it for faster runs on big images." },
-            { flag: "--max-new-tokens N", meaning: "Generation limit (default 8192)." },
-            { flag: "--temperature T", meaning: "0 = greedy. Default 0.7, like the upstream worker." },
-            { flag: "--top-p P, --top-k K", meaning: "Nucleus and top-k sampling. top-p defaults to 0.9." },
-            { flag: "--repetition-penalty R", meaning: "Default 1.1." },
-            { flag: "--seed N", meaning: "Sampling seed." },
-            { flag: "--cpu", meaning: "Run on the CPU even when a GPU is available (f32)." },
-            { flag: "--f32", meaning: "f32 instead of bf16 on the GPU: slower, for numerical checks." },
-            { flag: "-v, --verbose", meaning: "Print each decoding step (mtp or ar) to stderr." },
+            { flag: "--image FILE", meaning: "The image to segment (jpeg, png, webp, bmp). Not needed with --video." },
+            { flag: "--model NAME", meaning: <>sam-vit-b (default), sam-vit-l, sam-vit-h, mobile-sam, efficientsam-ti, efficientsam-s, sam2.1-hiera-&#123;tiny,small,base-plus,large&#125;, sam2-hiera-*, sam3.</> },
+            { flag: "--weights FILE", meaning: "Use this .safetensors checkpoint instead of the cached or downloaded one (Meta layout)." },
+            { flag: "--point X,Y[,0]", meaning: "Point prompt in image pixels; a trailing 0 makes it a background point. Repeatable." },
+            { flag: "--box X0,Y0,X1,Y1", meaning: "Box prompt in image pixels. With SAM 3 it is an exemplar box (\"find more like this\") and repeatable." },
+            { flag: "--text TEXT", meaning: "SAM 3: find and segment every instance of this concept. With --video it starts text-prompted detect-and-track." },
+            { flag: "--neg-box BOX", meaning: "SAM 3: negative exemplar box. Repeatable." },
+            { flag: "--threshold S", meaning: "SAM 3: minimum instance score for --text. Default 0.3." },
+            { flag: "--tracker", meaning: "SAM 3: treat --point / --box as SAM-style prompts for one object instead of text or exemplars." },
+            { flag: "--video DIR", meaning: "Track through the frames (images sorted by name) of this directory. SAM 2 and SAM 3." },
+            { flag: "--prompt-frame N", meaning: "Video: the frame the prompt belongs to; tracking runs forward from there. Default 0." },
+            { flag: "--detect-every N", meaning: "SAM 3 video with --text: re-run the detector every N frames to find objects that appear later. Default 5." },
+            { flag: "--out PATH", meaning: "Save the best mask as a PNG; with --video, a directory that gets one mask PNG per frame (and per object for --text)." },
+            { flag: "--index N", meaning: "Save candidate N (0-2) instead of the one with the highest predicted IoU." },
+            { flag: "--single", meaning: "Return one mask instead of three candidates." },
+            { flag: "--dtype f16|f32", meaning: "Compute dtype on CUDA. Default f16." },
+            { flag: "--cpu", meaning: "Run on the CPU even when a GPU is available." },
+            { flag: "--f32", meaning: "CPU: exact f32 instead of the bf16 kernels (AVX-512 BF16 CPUs only; slower)." },
+            { flag: "--bench N", meaning: "Time the encoder and the decoder over N runs." },
           ]}
         />
         <P>
-          Diagnostics (model load time, patch grid, token and step counts, timings) go to stderr, so stdout
-          stays clean for piping.
+          Diagnostics (model load time, device, timings) go to stderr, so stdout stays clean for piping. Masks
+          are not in a fixed semantic order across checkpoints, so pick by the predicted IoU (the default) or
+          inspect all three with <IC>--index</IC>.
         </P>
       </Section>
     </DocsLayout>

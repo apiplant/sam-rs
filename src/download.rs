@@ -108,12 +108,49 @@ pub fn fetch(repo: &str, file: &str) -> Result<PathBuf> {
     Ok(dest)
 }
 
-/// Path of the converted EfficientSAM checkpoint `name` (`efficient_sam_vitt` / `efficient_sam_vits`).
+/// Local path of `file` from `repo` when it is already in the cache (never downloads).
+pub fn cached(repo: &str, file: &str) -> Option<PathBuf> {
+    let p = cache_dir()?.join(repo.replace('/', "--")).join(file);
+    p.is_file().then_some(p)
+}
+
+/// Path of the EfficientSAM checkpoint `name` (`efficient_sam_vitt` / `efficient_sam_vits`) as a `.safetensors` file.
+/// The upstream release is a PyTorch `.pt`; on first use it is downloaded and converted once (f32, written to a
+/// `.part` file and renamed) into the cache. candle's pickle reader only builds tensors, it never runs pickled code.
+/// If the conversion fails the `.pt` itself is returned, and the loader reads it directly.
 pub fn fetch_efficientsam(name: &str) -> Result<PathBuf> {
     let dir = cache_dir().context("no cache directory available")?.join("yunyangx--EfficientSAM");
     let st = dir.join(format!("{name}.safetensors"));
     if st.is_file() {
         return Ok(st);
     }
-    bail!("{} is missing; convert the .pt checkpoint first (scripts/convert_efficientsam.py)", st.display())
+    let pt = fetch("yunyangx/EfficientSAM", &format!("{name}.pt"))?;
+    match convert_pt(&pt, &st) {
+        Ok(()) => Ok(st),
+        Err(e) => {
+            eprintln!("could not convert {} to safetensors ({e:#}); reading the .pt directly", pt.display());
+            Ok(pt)
+        }
+    }
+}
+
+/// Converts a PyTorch checkpoint (a flat state dict, or one nested under `"model"`) to a safetensors file.
+pub fn convert_pt(pt: &Path, dest: &Path) -> Result<()> {
+    use candle_core::{pickle, DType};
+    let mut tensors = pickle::read_all(pt).with_context(|| format!("reading {}", pt.display()))?;
+    if !tensors.iter().any(|(k, _)| k.ends_with("patch_embed.proj.weight")) {
+        tensors = pickle::read_all_with_key(pt, Some("model")).with_context(|| format!("reading {} (key \"model\")", pt.display()))?;
+    }
+    if tensors.is_empty() {
+        bail!("no tensors found in {}", pt.display());
+    }
+    let map = tensors
+        .into_iter()
+        .map(|(k, t)| Ok((k, t.to_dtype(DType::F32)?.contiguous()?)))
+        .collect::<candle_core::Result<std::collections::HashMap<_, _>>>()?;
+    let part = dest.with_extension("safetensors.part");
+    candle_core::safetensors::save(&map, &part).with_context(|| format!("writing {}", part.display()))?;
+    std::fs::rename(&part, dest)?;
+    eprintln!("converted {} -> {} ({} tensors)", pt.display(), dest.display(), map.len());
+    Ok(())
 }
