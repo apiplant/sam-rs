@@ -780,6 +780,27 @@ export function App() {
   );
 }
 
+/** Composites the mask (base64 8-bit grayscale PNG) over the image as alpha, returning a PNG data URL. */
+async function cutoutPng(loaded: Loaded, maskB64: string): Promise<string> {
+  const img = await createImageBitmap(loaded.blob);
+  const canvas = document.createElement("canvas");
+  canvas.width = img.width;
+  canvas.height = img.height;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
+  ctx.drawImage(img, 0, 0);
+  const mask = await createImageBitmap(await (await fetch(`data:image/png;base64,${maskB64}`)).blob());
+  const mc = document.createElement("canvas");
+  mc.width = canvas.width;
+  mc.height = canvas.height;
+  const mctx = mc.getContext("2d", { willReadFrequently: true })!;
+  mctx.drawImage(mask, 0, 0, mc.width, mc.height);
+  const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const maskData = mctx.getImageData(0, 0, mc.width, mc.height);
+  for (let i = 0; i < imgData.data.length; i += 4) imgData.data[i + 3] = maskData.data[i];
+  ctx.putImageData(imgData, 0, 0);
+  return canvas.toDataURL("image/png");
+}
+
 function ImageResults(props: {
   resp: SegmentResponse | null;
   picked: number | null;
@@ -790,6 +811,7 @@ function ImageResults(props: {
   hasImage: boolean;
   hasPrompt: boolean;
 }) {
+  const [cutting, setCutting] = createSignal<number | null>(null);
   const toggle = (i: number) => props.setHidden(props.hidden.includes(i) ? props.hidden.filter((x) => x !== i) : [...props.hidden, i]);
   return (
     <Show
@@ -834,15 +856,41 @@ function ImageResults(props: {
                     </span>
                     <span class="mt-1.5 block font-mono text-[11px] text-ink-400">{o.area.toLocaleString()} px{o.bbox ? ` · ${o.bbox.join(", ")}` : ""}</span>
                   </span>
-                  <a
-                    class="grid size-7 flex-none place-items-center rounded-md text-ink-400 hover:bg-ink-700 hover:text-ink-100"
-                    href={`data:image/png;base64,${o.png}`}
-                    download={`${(props.image?.name ?? "mask").replace(/\.[^.]+$/, "")}-mask-${idx() + 1}.png`}
-                    title="Download the mask (PNG)"
-                    onClick={(e) => e.stopPropagation()}
-                  >
-                    <Icon name="download" size={14} />
-                  </a>
+                  <span class="flex flex-none">
+                    <a
+                      class="grid size-7 place-items-center rounded-md text-ink-400 hover:bg-ink-700 hover:text-ink-100"
+                      href={`data:image/png;base64,${o.png}`}
+                      download={`${(props.image?.name ?? "mask").replace(/\.[^.]+$/, "")}-mask-${idx() + 1}.png`}
+                      title="Download the mask (PNG)"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      <Icon name="download" size={14} />
+                    </a>
+                    <Show when={props.image}>
+                      <button
+                        class="grid size-7 place-items-center rounded-md text-ink-400 hover:bg-ink-700 hover:text-ink-100 disabled:opacity-50"
+                        disabled={cutting() === idx()}
+                        title="Download the cutout: the image with the mask applied (PNG, transparent elsewhere)"
+                        onClick={async (e) => {
+                          e.stopPropagation();
+                          setCutting(idx());
+                          try {
+                            const url = await cutoutPng(props.image!, o.png);
+                            const a = document.createElement("a");
+                            a.href = url;
+                            a.download = `${props.image!.name.replace(/\.[^.]+$/, "")}-cutout-${idx() + 1}.png`;
+                            a.click();
+                          } finally {
+                            setCutting(null);
+                          }
+                        }}
+                      >
+                        <Show when={cutting() === idx()} fallback={<Icon name="cut" size={14} />}>
+                          <Spinner size={10} />
+                        </Show>
+                      </button>
+                    </Show>
+                  </span>
                 </div>
               );
             }}

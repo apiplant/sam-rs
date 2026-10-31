@@ -28,6 +28,7 @@ const PATHS: Record<string, string> = {
   lock: "M7 11V8a5 5 0 0 1 10 0v3M6 11h12v9H6z",
   cloud: "M7 18a4 4 0 0 1-.5-8A6 6 0 0 1 18 9.5a4 4 0 0 1-.5 8.5z",
   refresh: "M20 11a8 8 0 0 0-14.5-4M4 4v4h4M4 13a8 8 0 0 0 14.5 4M20 20v-4h-4",
+  cut: "M20 4L8.1 11.9M12 12l-3.9.1M14.5 14.5L20 20M9 6a3 3 0 1 1-6 0 3 3 0 0 1 6 0zM9 18a3 3 0 1 1-6 0 3 3 0 0 1 6 0z",
 };
 
 export function Icon(props: { name: string; size?: number; class?: string }) {
